@@ -3,20 +3,24 @@
 // Connect after Channel Connection, Activate after Connection Finalization
 // (Font Map).
 //
-// Only Enhanced RDP Security with PROTOCOL_SSL is requested. The server
-// certificate is verified against RootCAs (or the system roots) with hostname
-// checking; there is no fallback to Standard RDP Security and no CredSSP.
-// Probe and Connect never send a Client Info PDU; Activate sends one and
-// only includes a password when Options.Password is set by the caller.
+// Enhanced RDP Security uses PROTOCOL_SSL, or PROTOCOL_HYBRID when NLA is
+// explicitly required. Certificates are verified using roots and hostname,
+// or an explicit leaf fingerprint. There is no clear-text or NLA downgrade.
+// Probe stops at TLS without authenticating; Connect with NLA delegates
+// credentials via CredSSP, but never sends a Client Info PDU.
 package transport
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"rdp.local/kernel/bitmap"
@@ -28,15 +32,27 @@ const maxConnectionConfirmSize = 1024
 var (
 	// ErrProtocolNotSelected means the server answered the negotiation but did
 	// not pick TLS. The connection is closed instead of continuing in clear text.
-	ErrProtocolNotSelected = errors.New("server did not select PROTOCOL_SSL")
+	ErrProtocolNotSelected = errors.New("server did not select the required security protocol")
 )
 
 type Options struct {
+	// NLA requires PROTOCOL_HYBRID and CredSSP 5/6 with NTLMv2. No fallback
+	// to TLS-only is allowed. Probe still stops before authentication.
+	NLA bool
 	// ServerName is used for SNI and certificate verification. Defaults to the
 	// host part of the address.
 	ServerName string
 	// RootCAs is the trust store. nil uses the system roots.
 	RootCAs *x509.CertPool
+	// PinSHA256, when set, is the hex SHA-256 of the leaf certificate the
+	// server must present; chain and name verification are then skipped
+	// (self-signed Windows RDP hosts). A mismatch fails the handshake and the
+	// error names the observed fingerprint.
+	PinSHA256 string
+	// MinTLSVersion is the lowest TLS version accepted from the server
+	// (tls.VersionTLS10..13). Zero means TLS 1.2; Windows 7 / 2008 R2 only
+	// offer TLS 1.0 and need tls.VersionTLS10 explicitly.
+	MinTLSVersion uint16
 	// Cookie is sent as the X.224 routing token / cookie; empty omits it.
 	Cookie string
 	// Timeout bounds the whole exchange. Zero means 10s.
@@ -50,6 +66,11 @@ type Options struct {
 	// ColorDepth is the highColorDepth requested in Client Core Data and
 	// the preferred depth in Confirm Active: 15, 16 or 24 (0 means 24).
 	ColorDepth uint16
+	// Channels are the static virtual channels requested in Client Network
+	// Data (at most 31) and joined after the I/O channel. Dial exposes the
+	// allocated IDs via Session.StaticChannels in the same order. Empty
+	// requests none.
+	Channels []wire.ChannelDef
 
 	// Domain, UserName and Password fill the Client Info PDU sent by
 	// Activate. A non-empty Password sets INFO_AUTOLOGON and makes the
@@ -112,10 +133,13 @@ type Result struct {
 	Stage string
 
 	SelectedProtocol uint32
+	NLA              bool // CredSSP public-key proof verified and credentials delegated
+	CredSSPVersion   int
 	NegotiationFlags uint8
 	TLSVersion       uint16
 	CipherSuite      uint16
 	PeerSubject      string
+	PeerSHA256       string // hex SHA-256 of the leaf certificate
 	PeerNotAfter     time.Time
 
 	// Basic Settings Exchange.
@@ -206,24 +230,42 @@ func secureTransport(ctx context.Context, address string, opts Options) (*tls.Co
 		}
 	}
 
-	cc, err := Negotiate(conn, opts.Cookie, wire.ProtocolSSL)
+	cc, err := Negotiate(conn, opts.Cookie, opts.requestedProtocol())
 	if err != nil {
 		_ = conn.Close()
 		return nil, res, err
 	}
 	res.NegotiationFlags = cc.Flags
 	res.SelectedProtocol = cc.SelectedProtocol
-	if !cc.HasNegotiation || cc.SelectedProtocol != wire.ProtocolSSL {
+	if !cc.HasNegotiation || cc.SelectedProtocol != opts.requestedProtocol() {
 		_ = conn.Close()
 		return nil, res, fmt.Errorf("%w: server selected %s", ErrProtocolNotSelected, selectedString(cc))
 	}
 	res.Stage = StageNegotiation
 
-	tlsConn := tls.Client(conn, &tls.Config{
+	cfg := &tls.Config{
 		ServerName: serverName,
 		RootCAs:    opts.RootCAs,
 		MinVersion: tls.VersionTLS12,
-	})
+	}
+	if opts.MinTLSVersion != 0 {
+		cfg.MinVersion = opts.MinTLSVersion
+	}
+	if pin := strings.ToLower(strings.ReplaceAll(opts.PinSHA256, ":", "")); pin != "" {
+		cfg.InsecureSkipVerify = true // the pin below is the only check
+		cfg.VerifyPeerCertificate = func(raw [][]byte, _ [][]*x509.Certificate) error {
+			if len(raw) == 0 {
+				return errors.New("no server certificate")
+			}
+			sum := sha256.Sum256(raw[0])
+			got := hex.EncodeToString(sum[:])
+			if subtle.ConstantTimeCompare([]byte(got), []byte(pin)) != 1 {
+				return fmt.Errorf("server certificate sha256 %s does not match pin", got)
+			}
+			return nil
+		}
+	}
+	tlsConn := tls.Client(conn, cfg)
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		_ = conn.Close()
 		return nil, res, fmt.Errorf("tls handshake: %w", err)
@@ -234,6 +276,8 @@ func secureTransport(ctx context.Context, address string, opts Options) (*tls.Co
 	if len(state.PeerCertificates) > 0 {
 		leaf := state.PeerCertificates[0]
 		res.PeerSubject = leaf.Subject.String()
+		sum := sha256.Sum256(leaf.Raw)
+		res.PeerSHA256 = hex.EncodeToString(sum[:])
 		res.PeerNotAfter = leaf.NotAfter
 	}
 	res.Stage = StageTLS
@@ -268,8 +312,19 @@ func selectedString(cc wire.ConnectionConfirm) string {
 	return wire.ProtocolString(cc.SelectedProtocol)
 }
 
+func (o Options) requestedProtocol() uint32 {
+	if o.NLA {
+		return wire.ProtocolHybrid
+	}
+	return wire.ProtocolSSL
+}
+
 func TLSVersionString(v uint16) string {
 	switch v {
+	case tls.VersionTLS10:
+		return "TLS1.0"
+	case tls.VersionTLS11:
+		return "TLS1.1"
 	case tls.VersionTLS12:
 		return "TLS1.2"
 	case tls.VersionTLS13:

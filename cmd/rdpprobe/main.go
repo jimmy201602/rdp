@@ -39,10 +39,13 @@ type report struct {
 	Negotiation         string                 `json:"negotiation"`
 	SelectedProtocol    string                 `json:"selected_protocol,omitempty"`
 	NegotiationFlags    uint8                  `json:"negotiation_flags"`
+	NLA                 bool                   `json:"nla"`
+	CredSSPVersion      int                    `json:"credssp_version,omitempty"`
 	TLS                 string                 `json:"tls"`
 	TLSVersion          string                 `json:"tls_version,omitempty"`
 	CipherSuite         string                 `json:"cipher_suite,omitempty"`
 	PeerSubject         string                 `json:"peer_subject,omitempty"`
+	PeerSHA256          string                 `json:"peer_sha256,omitempty"`
 	PeerNotAfter        string                 `json:"peer_not_after,omitempty"`
 	MCSConnect          string                 `json:"mcs_connect"`
 	ServerVersion       string                 `json:"server_version,omitempty"`
@@ -72,9 +75,12 @@ type report struct {
 }
 
 func main() {
+	nla := flag.Bool("nla", false, "require CredSSP 5/6 with NTLMv2; all stages after tls delegate credentials")
 	addr := flag.String("addr", "", "server address host:port (required)")
 	serverName := flag.String("server-name", "", "name used for SNI and certificate verification (default: host from -addr)")
 	caFile := flag.String("ca", "", "PEM file with trusted root certificate(s); default uses system roots")
+	minTLS := flag.String("min-tls", "1.2", "lowest TLS version accepted: 1.0, 1.1, 1.2 or 1.3")
+	pin := flag.String("pin", "", "hex SHA-256 of the server's leaf certificate; pins it instead of CA/name verification (a mismatch reports the observed value)")
 	cookie := flag.String("cookie", "", "optional X.224 cookie, e.g. 'Cookie: mstshash=user'")
 	clientName := flag.String("client-name", "rdpkernel", "client name advertised in Client Core Data")
 	stage := flag.String("stage", transport.StageChannelJoin,
@@ -105,7 +111,11 @@ func main() {
 		fatal(errors.New("-png/-cursor-png require -observe"))
 	}
 
-	opts := transport.Options{ServerName: *serverName, Cookie: *cookie, Timeout: *timeout, ClientName: *clientName,
+	minVersion, ok := map[string]uint16{"1.0": tls.VersionTLS10, "1.1": tls.VersionTLS11, "1.2": tls.VersionTLS12, "1.3": tls.VersionTLS13}[*minTLS]
+	if !ok {
+		fatal(fmt.Errorf("-min-tls: unknown version %q", *minTLS))
+	}
+	opts := transport.Options{NLA: *nla, ServerName: *serverName, PinSHA256: *pin, MinTLSVersion: minVersion, Cookie: *cookie, Timeout: *timeout, ClientName: *clientName,
 		UserName: *user, Domain: *domain, StopAfter: *stage, Observe: *observe, Render: *observe != 0}
 	if *passwordEnv != "" {
 		if *user == "" {
@@ -162,6 +172,7 @@ func main() {
 	}
 
 	rep := report{
+		NLA: res.NLA, CredSSPVersion: res.CredSSPVersion,
 		Address:             *addr,
 		ServerName:          opts.ServerName,
 		TargetStage:         *stage,
@@ -182,7 +193,7 @@ func main() {
 		Finalization:        res.Finalization,
 		Observation:         res.Observation,
 		DurationMS:          res.Duration.Milliseconds(),
-		NotVerified:         notVerified(res.Stage, res.AutoLogon, res.Observation != nil),
+		NotVerified:         notVerified(res.Stage, res.AutoLogon, res.NLA, res.Observation != nil),
 	}
 	reached := transport.StageIndex(res.Stage)
 	rep.Negotiation = stageStatus(reached, target, err, transport.StageNegotiation, transport.StageNegotiation)
@@ -200,6 +211,7 @@ func main() {
 		rep.TLSVersion = transport.TLSVersionString(res.TLSVersion)
 		rep.CipherSuite = tls.CipherSuiteName(res.CipherSuite)
 		rep.PeerSubject = res.PeerSubject
+		rep.PeerSHA256 = res.PeerSHA256
 		rep.PeerNotAfter = res.PeerNotAfter.UTC().Format(time.RFC3339)
 	}
 	if res.ServerVersion != 0 {
@@ -247,7 +259,7 @@ func stageStatus(reached, target int, err error, first, last string) string {
 	}
 }
 
-func notVerified(stage string, autoLogon, observed bool) string {
+func notVerified(stage string, autoLogon, nla, observed bool) string {
 	items := []string{}
 	reached := transport.StageIndex(stage)
 	if reached < transport.StageIndex(transport.StageClientInfo) {
@@ -262,9 +274,12 @@ func notVerified(stage string, autoLogon, observed bool) string {
 	if reached < transport.StageIndex(transport.StageActivated) {
 		items = append(items, "session activation")
 	}
-	if !autoLogon {
+	switch {
+	case nla:
+		items = append(items, "logon outcome after CredSSP (credentials accepted by NLA; session logon result not observed by this tool)")
+	case !autoLogon:
 		items = append(items, "user authentication (no credentials sent)")
-	} else {
+	default:
 		items = append(items, "logon outcome (credentials sent; server-side result not observed by this tool)")
 	}
 	if observed {
@@ -285,7 +300,7 @@ func printText(rep report) {
 	fmt.Println()
 	fmt.Printf("tls:                %s", rep.TLS)
 	if rep.TLSVersion != "" {
-		fmt.Printf(" (%s, %s, peer=%s, expires=%s)", rep.TLSVersion, rep.CipherSuite, rep.PeerSubject, rep.PeerNotAfter)
+		fmt.Printf(" (%s, %s, peer=%s, sha256=%s, expires=%s)", rep.TLSVersion, rep.CipherSuite, rep.PeerSubject, rep.PeerSHA256, rep.PeerNotAfter)
 	}
 	fmt.Println()
 	fmt.Printf("mcs connect:        %s", rep.MCSConnect)

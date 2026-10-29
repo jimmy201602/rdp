@@ -26,8 +26,8 @@ var (
 
 // Connect runs Connection Initiation, the TLS upgrade, Basic Settings Exchange
 // and Channel Connection (user channel + I/O channel), then closes the
-// connection. It never proceeds to Secure Settings Exchange, so no
-// credentials or Client Info PDU are sent. Use Activate for the later stages.
+// connection. No Client Info PDU is sent; with Options.NLA, credentials
+// are delegated via CredSSP before MCS. Use Activate for the later stages.
 func Connect(ctx context.Context, address string, opts Options) (Result, error) {
 	return run(ctx, address, opts, StageChannelJoin)
 }
@@ -53,6 +53,9 @@ func runSequence(ctx context.Context, address string, opts Options, stopAfter st
 		return res, err
 	}
 	defer func() { _ = rawConn.Close() }()
+	if err := authenticateNLA(rawConn, address, opts, &res); err != nil {
+		return res, err
+	}
 	conn := newBufConn(rawConn)
 
 	if err := basicSettingsExchange(conn, opts, &res); err != nil {
@@ -75,11 +78,8 @@ func runSequence(ctx context.Context, address string, opts Options, stopAfter st
 	}
 	res.Stage = StageAttachUser
 
-	for _, channel := range []uint16{res.UserChannel, res.IOChannel} {
-		if err := joinChannel(conn, res.UserChannel, channel); err != nil {
-			return res, err
-		}
-		res.JoinedChannels = append(res.JoinedChannels, channel)
+	if err := joinChannels(conn, &res); err != nil {
+		return res, err
 	}
 	res.Stage = StageChannelJoin
 	if stopAfter == StageChannelJoin {
@@ -170,7 +170,7 @@ func basicSettingsExchange(conn net.Conn, opts Options, res *Result) error {
 	if err != nil {
 		return err
 	}
-	network, err := wire.ClientNetworkData{}.Encode()
+	network, err := wire.ClientNetworkData{Channels: opts.Channels}.Encode()
 	if err != nil {
 		return err
 	}
@@ -211,9 +211,9 @@ func basicSettingsExchange(conn net.Conn, opts Options, res *Result) error {
 			res.ServerVersion = sc.Version
 			res.ServerEarlyCapabilities = sc.EarlyCapabilityFlags
 			if sc.HasRequestedProtocols {
-				if sc.ClientRequestedProtocols != wire.ProtocolSSL {
+				if sc.ClientRequestedProtocols != opts.requestedProtocol() {
 					return fmt.Errorf("%w: SC_CORE echoed requested protocols %s, client sent %s",
-						ErrSettingsMismatch, wire.ProtocolString(sc.ClientRequestedProtocols), wire.ProtocolString(wire.ProtocolSSL))
+						ErrSettingsMismatch, wire.ProtocolString(sc.ClientRequestedProtocols), wire.ProtocolString(opts.requestedProtocol()))
 				}
 				res.ProtocolReconfirmed = true
 			}
@@ -236,8 +236,8 @@ func basicSettingsExchange(conn net.Conn, opts Options, res *Result) error {
 			haveNet = true
 			res.IOChannel = sn.IOChannel
 			res.StaticChannels = sn.ChannelIDs
-			if len(sn.ChannelIDs) != 0 {
-				return fmt.Errorf("%w: server allocated %d static channels, client requested none", ErrSettingsMismatch, len(sn.ChannelIDs))
+			if len(sn.ChannelIDs) != len(opts.Channels) {
+				return fmt.Errorf("%w: server allocated %d static channels, client requested %d", ErrSettingsMismatch, len(sn.ChannelIDs), len(opts.Channels))
 			}
 		}
 	}
@@ -249,6 +249,19 @@ func basicSettingsExchange(conn net.Conn, opts Options, res *Result) error {
 	}
 	if len(missing) != 0 {
 		return fmt.Errorf("%w: missing %v", ErrMissingServerData, missing)
+	}
+	return nil
+}
+
+// joinChannels joins the user channel, the I/O channel and every static
+// channel the server allocated, in that order.
+func joinChannels(conn net.Conn, res *Result) error {
+	channels := append([]uint16{res.UserChannel, res.IOChannel}, res.StaticChannels...)
+	for _, channel := range channels {
+		if err := joinChannel(conn, res.UserChannel, channel); err != nil {
+			return err
+		}
+		res.JoinedChannels = append(res.JoinedChannels, channel)
 	}
 	return nil
 }

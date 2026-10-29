@@ -7,11 +7,13 @@ import (
 	"rdp.local/kernel/wire"
 )
 
-// PDU is one unit read from a Conn: the payload of an I/O channel
-// SendDataRequest (FastPath false) or a complete raw fast-path input frame
-// (FastPath true).
+// PDU is one unit read from a Conn: the payload of a SendDataRequest on the
+// I/O channel (Channel 0) or on a joined static virtual channel (Channel is
+// the ID from ChannelIDs, Data the CHANNEL_PDU_HEADER + chunk as received),
+// or a complete raw fast-path input frame (FastPath true).
 type PDU struct {
 	FastPath bool
+	Channel  uint16
 	Data     []byte
 }
 
@@ -37,8 +39,15 @@ func (c *Conn) Credentials() Credentials { return c.creds }
 // UserChannel is the MCS user channel assigned to the client.
 func (c *Conn) UserChannel() uint16 { return c.s.userChannel }
 
-// ReadPDU returns the next client PDU on the I/O channel or a raw fast-path
-// input frame; data on other joined static channels is dropped.
+// Channels lists the static virtual channels the client requested (name and
+// options), in the order of ChannelIDs.
+func (c *Conn) Channels() []wire.ChannelDef { return c.s.channelDefs }
+
+// ChannelIDs lists the MCS channel IDs allocated for Channels.
+func (c *Conn) ChannelIDs() []uint16 { return c.s.channelIDs }
+
+// ReadPDU returns the next client PDU on the I/O channel or a joined static
+// channel, or a raw fast-path input frame.
 func (c *Conn) ReadPDU() (PDU, error) {
 	first, err := c.s.r.Peek(1)
 	if err != nil {
@@ -51,15 +60,31 @@ func (c *Conn) ReadPDU() (PDU, error) {
 		}
 		return PDU{FastPath: true, Data: frame}, nil
 	}
-	data, err := c.s.readIO()
+	id, data, err := c.s.readData()
 	if err != nil {
 		return PDU{}, err
 	}
-	return PDU{Data: data}, nil
+	if id == ioChannel {
+		id = 0
+	}
+	return PDU{Channel: id, Data: data}, nil
 }
 
 // WriteIO sends payload to the client on the I/O channel.
 func (c *Conn) WriteIO(payload []byte) error { return c.s.writeIO(payload) }
+
+// WriteChannel sends payload (CHANNEL_PDU_HEADER + chunk) to the client on a
+// static channel from ChannelIDs.
+func (c *Conn) WriteChannel(id uint16, payload []byte) error {
+	if !c.s.allowedChannel(id) || id == c.s.userChannel || id == ioChannel {
+		return fmt.Errorf("%w: static channel %d not allocated", ErrProtocol, id)
+	}
+	mcs, err := wire.EncodeSendDataIndication(c.s.userChannel, id, payload)
+	if err != nil {
+		return err
+	}
+	return c.s.writeMCS(mcs)
+}
 
 // WriteFastPath sends a complete fast-path output frame unchanged.
 func (c *Conn) WriteFastPath(frame []byte) error {

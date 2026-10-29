@@ -7,9 +7,11 @@
 // and re-encoded, everything else is forwarded as received); fast-path
 // frames are forwarded unchanged; client input is decoded for counting
 // only (keystroke codes are never logged). Static virtual channels the
-// client requests are accepted on the front end but not opened towards the
-// target, so their data is dropped. Either side closing or failing closes
-// the other and frees the session.
+// client requests are opened towards the target when AllowChannel admits
+// them and their chunks are relayed unchanged (CHANNEL_PDU_HEADER included)
+// with the MCS channel ID mapped between the two sides; data for channels
+// the policy refused is dropped. Either side closing or failing closes the
+// other and frees the session.
 package gateway
 
 import (
@@ -38,9 +40,12 @@ var (
 
 // Target is the backend a Route decision points to.
 type Target struct {
+	NLA        bool           // require backend CredSSP/NTLMv2 (front end remains TLS-only)
 	Address    string         // host:port
 	ServerName string         // TLS name to verify (default: host of Address)
 	RootCAs    *x509.CertPool // nil: system roots
+	PinSHA256  string         // hex SHA-256 of the target leaf certificate; replaces chain/name verification (self-signed RDP hosts)
+	MinTLS     uint16         // lowest TLS version accepted from the target (0: TLS 1.2; Windows 7 needs tls.VersionTLS10)
 	Timeout    time.Duration  // backend handshake budget (default 20s)
 }
 
@@ -55,6 +60,10 @@ type Config struct {
 	// AllowCapability filters capability set types relayed in Demand /
 	// Confirm Active. nil uses DefaultAllowCapability.
 	AllowCapability func(typ uint16) bool
+	// AllowChannel decides which static virtual channels requested by the
+	// client (by name, e.g. "cliprdr", "rdpdr", "rdpsnd", "drdynvc") are
+	// opened towards the target. nil admits all of them.
+	AllowChannel func(name string) bool
 	// HandshakeTimeout bounds the front-end handshake (default 30s).
 	HandshakeTimeout time.Duration
 	// MaxSessions limits concurrent client connections (default 64).
@@ -82,6 +91,8 @@ type Summary struct {
 	ServerBytes         int64
 	InputEvents         map[string]int
 	DroppedCapabilities map[uint16]int
+	ChannelPDUs         map[string]int // relayed chunks per channel name (both directions)
+	DroppedChannels     map[string]int // chunks dropped on channels the policy refused
 	Reactivations       int
 	End                 string // "client-closed", "target-closed", "canceled", "error"
 	Err                 error
@@ -164,11 +175,13 @@ func (g *Gateway) handle(ctx context.Context, c *server.Conn) error {
 	default:
 		depth = 24
 	}
+	channels := newChannelMap(c, g.cfg.AllowChannel)
 	creds := c.Credentials()
 	opts := transport.Options{
-		ServerName: target.ServerName, RootCAs: target.RootCAs, Timeout: target.Timeout,
+		NLA: target.NLA, ServerName: target.ServerName, RootCAs: target.RootCAs, PinSHA256: target.PinSHA256, MinTLSVersion: target.MinTLS, Timeout: target.Timeout,
 		ClientName: peer.ClientName, DesktopWidth: peer.DesktopWidth, DesktopHeight: peer.DesktopHeight, ColorDepth: depth,
-		Domain: creds.Domain, UserName: creds.UserName, Password: creds.Password,
+		Channels: channels.defs,
+		Domain:   creds.Domain, UserName: creds.UserName, Password: creds.Password,
 	}
 	creds = server.Credentials{}
 	_ = creds
@@ -180,20 +193,66 @@ func (g *Gateway) handle(ctx context.Context, c *server.Conn) error {
 		_ = c.Deny(wire.ErrInfoServerDeniedConnection)
 		return fmt.Errorf("%w: %s: %v", ErrBackend, target.Address, err)
 	}
-	g.cfg.Logf("%s: target %s licensed (user channel %d), relaying", peer.RemoteAddr, target.Address, backend.UserChannel())
-	r := &relay{g: g, client: c, backend: backend, sum: Summary{
+	channels.bind(backend.StaticChannels())
+	g.cfg.Logf("%s: target %s licensed (user channel %d, channels %v), relaying", peer.RemoteAddr, target.Address, backend.UserChannel(), channels.names())
+	r := &relay{g: g, client: c, backend: backend, channels: channels, sum: Summary{
 		RemoteAddr: peer.RemoteAddr, UserName: peer.UserName, Domain: peer.Domain, ClientName: peer.ClientName,
 		Target: target.Address, InputEvents: map[string]int{}, DroppedCapabilities: map[uint16]int{},
+		ChannelPDUs: map[string]int{}, DroppedChannels: map[string]int{},
 	}}
 	return r.run(ctx)
 }
 
+// channelMap pairs the static channels the client requested with the ones
+// opened towards the target.
+type channelMap struct {
+	defs        []wire.ChannelDef // requested from the target, in order
+	frontIDs    []uint16          // client-side IDs of defs
+	frontNames  map[uint16]string // every client channel, admitted or not
+	frontToBack map[uint16]uint16
+	backToFront map[uint16]uint16
+	backToName  map[uint16]string
+}
+
+func newChannelMap(c *server.Conn, allow func(string) bool) *channelMap {
+	m := &channelMap{frontNames: map[uint16]string{}, frontToBack: map[uint16]uint16{}, backToFront: map[uint16]uint16{}, backToName: map[uint16]string{}}
+	ids := c.ChannelIDs()
+	for i, def := range c.Channels() {
+		m.frontNames[ids[i]] = def.Name
+		if allow == nil || allow(def.Name) {
+			m.defs = append(m.defs, def)
+			m.frontIDs = append(m.frontIDs, ids[i])
+		}
+	}
+	return m
+}
+
+func (m *channelMap) bind(backIDs []uint16) {
+	for i, back := range backIDs {
+		if i >= len(m.frontIDs) {
+			break
+		}
+		m.frontToBack[m.frontIDs[i]] = back
+		m.backToFront[back] = m.frontIDs[i]
+		m.backToName[back] = m.defs[i].Name
+	}
+}
+
+func (m *channelMap) names() []string {
+	names := make([]string, len(m.defs))
+	for i, d := range m.defs {
+		names[i] = d.Name
+	}
+	return names
+}
+
 type relay struct {
-	g       *Gateway
-	client  *server.Conn
-	backend *transport.Session
-	mu      sync.Mutex
-	sum     Summary
+	g        *Gateway
+	client   *server.Conn
+	backend  *transport.Session
+	channels *channelMap
+	mu       sync.Mutex
+	sum      Summary
 }
 
 type relayEnd struct {
@@ -231,9 +290,9 @@ func (r *relay) run(ctx context.Context) error {
 	}
 	sum := r.sum
 	r.mu.Unlock()
-	r.g.cfg.Logf("%s: relay to %s ended (%s): client %d pdus + %d fast-path, target %d pdus + %d fast-path, input %v, dropped caps %v, reactivations %d",
+	r.g.cfg.Logf("%s: relay to %s ended (%s): client %d pdus + %d fast-path, target %d pdus + %d fast-path, input %v, dropped caps %v, channels %v, dropped channels %v, reactivations %d",
 		sum.RemoteAddr, sum.Target, sum.End, sum.ClientPDUs, sum.ClientFastPath, sum.ServerPDUs, sum.ServerFastPath,
-		sum.InputEvents, sum.DroppedCapabilities, sum.Reactivations)
+		sum.InputEvents, sum.DroppedCapabilities, sum.ChannelPDUs, sum.DroppedChannels, sum.Reactivations)
 	if r.g.cfg.OnRelay != nil {
 		r.g.cfg.OnRelay(sum)
 	}
@@ -266,6 +325,24 @@ func (r *relay) clientToTarget() relayEnd {
 			r.sum.ClientFastPath++
 			r.mu.Unlock()
 			if err := r.backend.WriteFastPath(pdu.Data); err != nil {
+				return relayEnd{end: "target-closed"}
+			}
+			continue
+		}
+		if pdu.Channel != 0 {
+			back, ok := r.channels.frontToBack[pdu.Channel]
+			name := r.channels.frontNames[pdu.Channel]
+			r.mu.Lock()
+			if ok {
+				r.sum.ChannelPDUs[name]++
+			} else {
+				r.sum.DroppedChannels[name]++
+			}
+			r.mu.Unlock()
+			if !ok {
+				continue
+			}
+			if err := r.backend.WriteChannel(back, pdu.Data); err != nil {
 				return relayEnd{end: "target-closed"}
 			}
 			continue
@@ -335,6 +412,19 @@ func (r *relay) targetToClient() relayEnd {
 			r.sum.ServerFastPath++
 			r.mu.Unlock()
 			if err := r.client.WriteFastPath(pdu.Data); err != nil {
+				return relayEnd{end: "client-closed"}
+			}
+			continue
+		}
+		if pdu.Channel != 0 {
+			front, ok := r.channels.backToFront[pdu.Channel]
+			if !ok {
+				return relayEnd{end: "error", err: fmt.Errorf("%w: target data on unmapped channel %d", ErrRelay, pdu.Channel)}
+			}
+			r.mu.Lock()
+			r.sum.ChannelPDUs[r.channels.backToName[pdu.Channel]]++
+			r.mu.Unlock()
+			if err := r.client.WriteChannel(front, pdu.Data); err != nil {
 				return relayEnd{end: "client-closed"}
 			}
 			continue

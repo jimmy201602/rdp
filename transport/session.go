@@ -10,11 +10,14 @@ import (
 	"rdp.local/kernel/wire"
 )
 
-// PDU is one unit read from a Session after licensing: either the payload
-// of an I/O channel SendDataIndication (FastPath false) or a complete raw
-// fast-path output frame (FastPath true), both ready to be relayed.
+// PDU is one unit read from a Session after licensing: the payload of a
+// SendDataIndication on the I/O channel (Channel 0) or on a joined static
+// virtual channel (Channel is the server-allocated ID, Data is the
+// CHANNEL_PDU_HEADER + chunk as received), or a complete raw fast-path
+// output frame (FastPath true); all ready to be relayed.
 type PDU struct {
 	FastPath bool
+	Channel  uint16
 	Data     []byte
 }
 
@@ -36,6 +39,10 @@ func Dial(ctx context.Context, address string, opts Options) (*Session, error) {
 	start := time.Now()
 	rawConn, res, err := secureTransport(ctx, address, opts)
 	if err != nil {
+		return nil, err
+	}
+	if err := authenticateNLA(rawConn, address, opts, &res); err != nil {
+		_ = rawConn.Close()
 		return nil, err
 	}
 	conn := newBufConn(rawConn)
@@ -73,11 +80,8 @@ func (s *Session) handshake(opts Options, res *Result) error {
 		return fmt.Errorf("attach user confirm: %w", err)
 	}
 	res.Stage = StageAttachUser
-	for _, channel := range []uint16{res.UserChannel, res.IOChannel} {
-		if err := joinChannel(conn, res.UserChannel, channel); err != nil {
-			return err
-		}
-		res.JoinedChannels = append(res.JoinedChannels, channel)
+	if err := joinChannels(conn, res); err != nil {
+		return err
 	}
 	res.Stage = StageChannelJoin
 	if err := sendClientInfo(conn, opts, res); err != nil {
@@ -97,8 +101,12 @@ func (s *Session) Result() Result { return s.res }
 // UserChannel is the MCS user channel the server assigned to this client.
 func (s *Session) UserChannel() uint16 { return s.res.UserChannel }
 
-// ReadPDU returns the next server PDU. Data on channels other than the I/O
-// channel is skipped (no static channels are requested). A
+// StaticChannels returns the IDs the server allocated for Options.Channels,
+// in request order.
+func (s *Session) StaticChannels() []uint16 { return s.res.StaticChannels }
+
+// ReadPDU returns the next server PDU on the I/O channel or on a joined
+// static channel; data on any other channel is skipped. A
 // DisconnectProviderUltimatum is returned as ErrDisconnected.
 func (s *Session) ReadPDU() (PDU, error) {
 	for {
@@ -127,7 +135,27 @@ func (s *Session) ReadPDU() (PDU, error) {
 		if sd.ChannelID == s.res.IOChannel {
 			return PDU{Data: sd.Data}, nil
 		}
+		for _, id := range s.res.StaticChannels {
+			if sd.ChannelID == id {
+				return PDU{Channel: id, Data: sd.Data}, nil
+			}
+		}
 	}
+}
+
+// WriteChannel sends payload (CHANNEL_PDU_HEADER + chunk) on a joined static
+// channel.
+func (s *Session) WriteChannel(id uint16, payload []byte) error {
+	for _, joined := range s.res.StaticChannels {
+		if joined == id {
+			mcs, err := wire.EncodeSendDataRequest(s.res.UserChannel, id, payload)
+			if err != nil {
+				return err
+			}
+			return writeMCS(s.conn, mcs)
+		}
+	}
+	return fmt.Errorf("%w: static channel %d not joined", wire.ErrMCS, id)
 }
 
 // ErrDisconnected is returned by ReadPDU when the server sends a

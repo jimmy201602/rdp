@@ -38,6 +38,7 @@ type session struct {
 	authorized  bool
 	userChannel uint16
 	channelIDs  []uint16
+	channelDefs []wire.ChannelDef
 	joined      map[uint16]bool
 	clientCore  wire.ClientCoreData
 	clientCaps  []wire.CapabilitySet
@@ -234,6 +235,7 @@ func (s *session) mcsConnect(context.Context) error {
 	for i, ch := range channels {
 		s.peer.Channels = append(s.peer.Channels, ch.Name)
 		s.channelIDs = append(s.channelIDs, firstStaticChannel+uint16(i))
+		s.channelDefs = append(s.channelDefs, ch)
 	}
 	s.userChannel = firstStaticChannel + uint16(len(channels))
 
@@ -328,30 +330,47 @@ func (s *session) allowedChannel(id uint16) bool {
 // skipping data on other static channels.
 func (s *session) readIO() ([]byte, error) {
 	for {
+		id, data, err := s.readData()
+		if err != nil {
+			return nil, err
+		}
+		if id == ioChannel {
+			return data, nil
+		}
+	}
+}
+
+// readData returns the next SendDataRequest payload with its channel ID
+// (the I/O channel or a joined static channel).
+func (s *session) readData() (uint16, []byte, error) {
+	for {
 		var mcs []byte
 		if s.pending != nil {
 			mcs, s.pending = s.pending, nil
 		} else {
 			var err error
 			if mcs, err = s.readMCS(); err != nil {
-				return nil, err
+				return 0, nil, err
 			}
 		}
 		if reason, ok := wire.IsDisconnectProviderUltimatum(mcs); ok {
-			return nil, fmt.Errorf("%w: client disconnected (reason %d)", io.EOF, reason)
+			return 0, nil, fmt.Errorf("%w: client disconnected (reason %d)", io.EOF, reason)
 		}
 		sd, err := wire.DecodeSendDataRequest(mcs)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrProtocol, err)
+			return 0, nil, fmt.Errorf("%w: %v", ErrProtocol, err)
 		}
 		if sd.UserChannel != s.userChannel {
-			return nil, fmt.Errorf("%w: data from user channel %d, expected %d", ErrProtocol, sd.UserChannel, s.userChannel)
+			return 0, nil, fmt.Errorf("%w: data from user channel %d, expected %d", ErrProtocol, sd.UserChannel, s.userChannel)
 		}
 		if sd.ChannelID == ioChannel {
-			return sd.Data, nil
+			return ioChannel, sd.Data, nil
 		}
 		if !s.joined[sd.ChannelID] {
-			return nil, fmt.Errorf("%w: data on unjoined channel %d", ErrProtocol, sd.ChannelID)
+			return 0, nil, fmt.Errorf("%w: data on unjoined channel %d", ErrProtocol, sd.ChannelID)
+		}
+		if sd.ChannelID != s.userChannel {
+			return sd.ChannelID, sd.Data, nil
 		}
 	}
 }

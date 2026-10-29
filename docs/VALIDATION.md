@@ -1,4 +1,4 @@
-# 验证环境与结果（G1 协商 + TLS，G2 第一段 MCS/GCC + Channel Join，G2 第二段 Client Info → Font Map，G2 第三段 Font Map 后观察，G2 第四段位图解码，G2 第五段 Fast-Path 输出 + 指针渲染，G3-1 服务端角色 + xfreerdp 真实客户端，G3-3 网关 xfreerdp → rdpgw → xrdp）
+# 验证环境与结果（G1 协商 + TLS，G2 第一段 MCS/GCC + Channel Join，G2 第二段 Client Info → Font Map，G2 第三段 Font Map 后观察，G2 第四段位图解码，G2 第五段 Fast-Path 输出 + 指针渲染，G3-1 服务端角色 + xfreerdp 真实客户端，G3-3 网关 xfreerdp → rdpgw → xrdp，G3-4 静态虚拟通道透传 + 后端 NLA：xfreerdp → rdpgw → Windows 7 / Server 2016）
 
 本文记录隔离 xrdp 互操作环境的搭建方式、执行命令和实际结果。结论覆盖 TPKT/X.224/RDP 安全协商、TLS 服务器认证、MCS Connect-Initial/Response 与 GCC Basic Settings Exchange（含协商结果重确认）、Erect Domain / Attach User / Channel Join（用户通道 + I/O 通道）、Client Info、MS-RDPELE 许可、Demand/Confirm Active 能力交换和 Synchronize/Control/Font List/Font Map 连接收尾。G2 第三段在 Font Map 后保持连接读取服务端输出（Slow-Path Update / Pointer / Save Session Info 分类计数）；G2 第四段把 Bitmap Update 解码（Interleaved RLE）到帧缓冲并导出 PNG，在 xrdp 上得到完整的登录界面和 xfce 桌面画面（见 5.5）；G2 第五段声明 FASTPATH_OUTPUT_SUPPORTED，读循环同时处理 TPKT 与 fast-path PDU，并把指针更新解码成 RGBA 光标（见 5.6）。G3-1 反向实现服务端角色（`server` 包 / `rdpserve`），用 Go 客户端回环 e2e 和 VM 上的真实 xfreerdp 2.6.1 + Xvfb 验证了协商、TLS、Client Info 策略、许可、能力交换、收尾和位图/光标输出（见 5.7）。orders、输入、虚拟通道未实现；带测试账号时 xrdp 侧日志记录登录成功并启动了 Xorg 会话，但 xrdp 不发 Save Session Info，协议层没有登录通知（见 5.4）。
 
@@ -225,13 +225,30 @@ VM 真实链路：Ubuntu 22.04 + Xvfb :99，xfreerdp 2.6.1 → `rdpgw 127.0.0.1:
 
 说明：xrdp 对网关发的 Demand Active 丢了类型 6（xrdp 自定义 / 未在 MS-RDPBCGR 中定义）、28 Surface Commands、29 Bitmap Codecs、30 Frame Acknowledge，xfreerdp 因而只用 orders + 位图更新，桌面仍完整；xrdp 全程无 Deactivate All（重激活路径只有单测）。排错记录：一次“登录窗 + 黑屏”是测试脚本问题——`sh -c '…$RDP_PW…'` 未 `export` 导致密码为空，xrdp 按规则关掉 autologin 显示登录窗（`xrdp_sec.c`：cbPassword==0 → rdp_autologin=0），黑屏则是 xfreerdp 已退出后 Xvfb 的裸根窗口；`docker start` 已停止的 xrdp 容器会因残留 `xrdp-sesman.pid` 启动失败，`start-xrdp.sh` 现在先删除陈旧 pid 文件。
 
+### 5.9 G3-4（2026-10-29，静态虚拟通道透传 + 后端 NLA：本机 xfreerdp → rdpgw → Windows 7 / Windows Server 2016）
+
+本地 macOS：`gofmt`/`go vet`/`golangci-lint`/`CGO_ENABLED=0 go test ./...` 通过。新增单测：`gateway.TestChannelRelay`（客户端请求 rdpdr+cliprdr，策略只放行 cliprdr：目标只看到 cliprdr，cliprdr 块经网关回显原样、rdpdr 块被丢弃并计数）；`transport` 的 `TestMD4Vectors`（RFC 1320 四组向量）、`TestNTOWFv2Vector`（MS-NLMP 4.2.4.1.1）、`TestCredSSPExchange`（进程内假 CredSSP 服务端校验 NTLMv2 proof、MIC、MsvAvChannelBindings/SPN、客户端公钥绑定，回送服务端绑定后解密 TSPasswordCreds 得到 domain/user/password）、`TestCredSSPRejectsWrongServerBinding`（服务端公钥绑定不符 → 客户端拒绝）、`TestReadTSRequestErrorCode`（errorCode NTSTATUS 透出）。
+
+真实链路：macOS + XQuartz，xfreerdp 3.31.1（`/sec:tls /cert:ignore /size:1280x800 +clipboard /drive:gwshare,/tmp/rdpdrive`）→ 本机 `rdpgw`（临时自签前端证书）→ 局域网 Windows 主机。目标证书均为自签名，用 `rdpprobe -pin 00` 先读出叶证书 SHA-256 再以 `-target-pin` 固定。
+
+| 用例 | 结果 |
+|---|---|
+| `rdpprobe -addr 192.0.2.10:3389 -stage tls` | Windows 7 SP1 只提供 TLS 1.0：默认 MinVersion 1.2 握手失败，`-min-tls 1.0` 后 `tls ok`（TLS1.0, RSA-AES128-SHA） |
+| `rdpprobe -addr 192.0.2.20:3389 -stage tls` | Server 2016 回 `RDP_NEG_FAILURE HYBRID_REQUIRED_BY_SERVER`；`-nla` 后 `negotiation ok (PROTOCOL_HYBRID, flags=0x1f)` |
+| `rdpprobe -addr 192.0.2.20:3389 -nla -pin … -stage activated -user administrator -password-env … -observe 6s` | `nla: true, credssp_version: 6`，TLS1.2 ECDHE-RSA-AES256-GCM，MCS → Client Info → `license valid-client` → 17 个服务端能力集 → Font Map；观察 6 s 收到 87 个 fast-path Bitmap Update（1108 矩形）、指针更新，以及 Save Session Info `logon info_type 1, session 2, domain WIN-EXAMPLEPC1, user Administrator`——NLA 凭据被接受并登录 |
+| `rdpgw -listen 127.0.0.1:33892 -target 192.0.2.10:3389 -target-min-tls 1.0 -target-pin … -allow-user win7`；xfreerdp `/u:win7` | 网关 `target … licensed (user channel 1008, channels [rdpdr rdpsnd cliprdr drdynvc]), relaying`：4 个静态通道在目标侧同名分配并加入；FreeRDP 窗口显示 Windows 7 旗舰版桌面（控制面板「系统」窗口、任务栏、输入法状态） |
+| `rdpgw -listen 127.0.0.1:33893 -target 192.0.2.20:3389 -target-nla -target-pin … -allow-user administrator`；xfreerdp `/u:administrator` | 前端 xfreerdp 仍是 TLS-only；网关对目标完成 CredSSP 后 `licensed (user channel 1009, channels [rdpdr rdpsnd cliprdr drdynvc]), relaying`；窗口显示 Server 2016 桌面（图标、开始菜单栏、工具提示） |
+| 错误的 `-target-pin` | 网关 `target … failed at handshake: tls handshake: server certificate sha256 4109… does not match pin`，客户端收到 `ERRINFO_SERVER_DENIED_CONNECTION` 退出；错误值出现在日志里便于首次固定 |
+
+说明：macOS 上 XQuartz 不带 XTEST 扩展，xdotool 无法向 FreeRDP 窗口注入输入；桌面内的剪贴板/驱动器操作需手工进行，网关在 relay 结束时按通道名输出两向块计数（`channels map[cliprdr:… rdpdr:… drdynvc:…]`）。`rdpprobe -png` 对 Server 2016 的 32bpp Interleaved RLE 位图解码报 `truncated stream`（探测器渲染限制，网关不解码位图、不受影响）。
+
 ## 6. 本轮验证不覆盖
 
 - 用户认证结果的协议层判定：无 NLA/CredSSP；xrdp 侧日志确认 INFO_AUTOLOGON 凭据登录成功并启动了 Xorg 会话，但观察窗口内没有收到任何 Save Session Info，探测器不能自行判定登录结果；Save Session Info / Set Error Info 解码只经单元测试验证。错误密码用例未跑（xrdp 失败时同样只在服务端日志体现）。
 - 许可的 Platform Challenge / New License / Upgrade License 分支仅在本地假服务器与 MS-RDPELE 公开样例上验证，xrdp 不走该分支。
 - 图形：只解码 Slow-Path Bitmap Update（xrdp 上只出现 24bpp RLE，8/15/16/32bpp、未压缩位图和 Palette 只经单测；解码正确性靠肉眼比对 PNG，没有逐像素参考）；orders 不解析，Surface Commands 只计数；fast-path 分片重组、压缩标志拒绝、Large Pointer、Pointer Position 合成只经单测（xrdp 更新都很小、不发位置）；输入；其余 Share Data PDU 只按 pduType2 计数。
-- 静态虚拟通道（客户端请求 0 个）、消息通道、多传输通道；服务端若分配未请求的通道会被拒绝。
-- 真实 Windows 目标、公网目标、Standard RDP Security 服务器（探测器按设计拒绝）。
-- 网关：静态虚拟通道数据（cliprdr/rdpdr/rdpsnd/drdynvc）在前端被丢弃、不向目标转发（目标侧 Dial 不请求通道，xrdp 日志 `drdynvc not found`）；没有 NLA/CredSSP（前后端都是 TLS-only，目标要求 NLA 时握手失败）；目标证书必须经 `-target-ca`/系统根验证，无跳过选项；被过滤的能力（codecs/Surface Commands/Frame Ack/RAIL 等）意味着不支持 RemoteFX/GFX、RemoteApp；输入只透传并计数，不做键盘布局改写或策略拦截；重激活（Deactivate All）、客户端 Shutdown Request、多会话并发上限、握手超时只在单测/代码路径上；真实 Windows 目标与 mstsc 客户端未测。
+- 静态虚拟通道只做透传（不解析 cliprdr/rdpdr/rdpsnd/drdynvc 协议，不做通道级策略如只读剪贴板）、消息通道、多传输通道；服务端分配的通道数与请求不符会被拒绝。
+- 公网目标、Standard RDP Security 服务器（探测器按设计拒绝）；Windows 目标只测了 Windows 7 SP1（TLS 1.0）与 Server 2016（NLA）各一台，均为自签名证书 + `-pin`，未测域账户 / Kerberos、HYBRID_EX、CredSSP 服务端要求 Early User Auth、NTLM 被禁用（只允许 Kerberos）的主机。
+- 网关：前端仍 TLS-only（mstsc 默认会先请求 NLA，需要服务器侧接受 TLS 降级或客户端改为 TLS），不做 CredSSP 服务端；目标证书必须经 `-target-ca`/系统根或 `-target-pin` 叶证书指纹验证，没有跳过选项；被过滤的能力（codecs/Surface Commands/Frame Ack/RAIL 等）意味着不支持 RemoteFX/GFX、RemoteApp；输入只透传并计数，不做键盘布局改写或策略拦截；重激活（Deactivate All）、客户端 Shutdown Request、多会话并发上限、握手超时只在单测/代码路径上；真实 Windows 目标与 mstsc 客户端未测。
 - 服务端角色：只对 xfreerdp 2.6.1 验证，mstsc/Windows 客户端、NLA 客户端（被按设计降到 TLS 或拒绝）、多显示器、Auto-Reconnect、重激活（Deactivate All → 新 Demand Active）、Shutdown Request 真实路径、空闲超时、并发上限（只有单元/手工路径）未在真实客户端上验证；位图只发未压缩矩形，没有压缩编码、fast-path 输出、orders；输入被丢弃；不连接上游目标。
 - 证书验证关闭或降级路径：不存在该选项，也不计划提供。

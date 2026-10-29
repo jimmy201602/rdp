@@ -266,3 +266,87 @@ func TestCapabilityFilter(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestChannelRelay opens a static channel through the gateway to a Handler
+// backend that echoes chunks, and checks that a channel the policy refuses
+// is not opened towards the target and its data is dropped.
+func TestChannelRelay(t *testing.T) {
+	echoed := make(chan []wire.ChannelDef, 1)
+	backCert, backPool := testCertificate(t, "target")
+	backSrv, err := server.New(server.Config{
+		TLS: &tls.Config{Certificates: []tls.Certificate{backCert}},
+		Handler: func(_ context.Context, c *server.Conn) error {
+			echoed <- c.Channels()
+			for {
+				pdu, err := c.ReadPDU()
+				if err != nil {
+					return nil
+				}
+				if pdu.Channel != 0 {
+					if err := c.WriteChannel(pdu.Channel, pdu.Data); err != nil {
+						return err
+					}
+				}
+			}
+		},
+		HandshakeTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backAddr := serve(t, "target", backSrv.Serve)
+	relays := make(chan Summary, 1)
+	gwCert, gwPool := testCertificate(t, "gateway")
+	gw, err := New(Config{
+		TLS: &tls.Config{Certificates: []tls.Certificate{gwCert}},
+		Route: func(context.Context, server.Peer) (Target, error) {
+			return Target{Address: backAddr, ServerName: "target", RootCAs: backPool}, nil
+		},
+		AllowChannel:     func(name string) bool { return name == "cliprdr" },
+		HandshakeTimeout: 10 * time.Second,
+		Logf:             func(string, ...any) {},
+		OnRelay:          func(r Summary) { relays <- r },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gwAddr := serve(t, "gateway", gw.Serve)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := transport.Dial(ctx, gwAddr, transport.Options{
+		ServerName: "gateway", RootCAs: gwPool, Timeout: 10 * time.Second,
+		Channels: []wire.ChannelDef{{Name: "rdpdr", Options: 0x80800000}, {Name: "cliprdr", Options: 0xc0a00000}},
+		UserName: "alice", Password: "pw",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := client.StaticChannels()
+	if len(ids) != 2 {
+		t.Fatalf("client got channels %v", ids)
+	}
+	rdpdr, cliprdr := ids[0], ids[1]
+	if defs := wait(t, echoed, "target channels"); len(defs) != 1 || defs[0].Name != "cliprdr" || defs[0].Options != 0xc0a00000 {
+		t.Fatalf("target saw channels %+v", defs)
+	}
+	chunk := []byte{8, 0, 0, 0, 3, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8} // CHANNEL_PDU_HEADER + 8 bytes
+	if err := client.WriteChannel(rdpdr, chunk); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.WriteChannel(cliprdr, chunk); err != nil {
+		t.Fatal(err)
+	}
+	pdu, err := client.ReadPDU()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pdu.FastPath || pdu.Channel != cliprdr || string(pdu.Data) != string(chunk) {
+		t.Fatalf("echo %+v", pdu)
+	}
+	_ = client.Disconnect()
+	sum := wait(t, relays, "relay summary")
+	if sum.End != "client-closed" || sum.ChannelPDUs["cliprdr"] != 2 || sum.DroppedChannels["rdpdr"] != 1 || len(sum.ChannelPDUs) != 1 {
+		t.Fatalf("summary %+v", sum)
+	}
+}
