@@ -191,6 +191,18 @@ type ClientConfig struct {
 	User      string
 	Domain    string
 	Password  string
+	// MinVersion is the lowest CredSSP version accepted from the server;
+	// 0 means 5. Versions 2-4 (unpatched Windows 7 / 2008 R2, CVE-2018-0886)
+	// bind the TLS public key without a nonce and are only worth enabling
+	// together with certificate pinning.
+	MinVersion int
+}
+
+func (c ClientConfig) minVersion() int {
+	if c.MinVersion <= 0 {
+		return 5
+	}
+	return c.MinVersion
 }
 
 // ClientResult reports a completed client exchange.
@@ -213,12 +225,13 @@ func Client(conn io.ReadWriter, cfg ClientConfig) (ClientResult, error) {
 	}
 	challenge, err := readTSRequest(conn)
 	if err != nil {
-		return ClientResult{}, err
+		return ClientResult{}, fmt.Errorf("after NTLM NEGOTIATE: %w", err)
 	}
 	// Older versions lack the nonce-bound public-key proof (CVE-2018-0886).
-	if challenge.Version < 5 || challenge.Version > 6 {
-		return ClientResult{}, errors.New("server must support CredSSP version 5 or 6")
+	if challenge.Version < cfg.minVersion() || challenge.Version > 6 || challenge.Version < 2 {
+		return ClientResult{}, fmt.Errorf("server offers CredSSP version %d, need %d-6 (enable legacy CredSSP for unpatched Windows 7 / 2008 R2)", challenge.Version, cfg.minVersion())
 	}
+	legacy := challenge.Version < 5
 	if len(challenge.Tokens) != 1 || len(challenge.PubKeyAuth) != 0 || len(challenge.AuthInfo) != 0 {
 		return ClientResult{}, errors.New("expected one NTLM challenge token")
 	}
@@ -226,17 +239,23 @@ func Client(conn io.ReadWriter, cfg ClientConfig) (ClientResult, error) {
 	if err != nil {
 		return ClientResult{}, err
 	}
-	nonce := make([]byte, 32)
-	if _, err := rand.Read(nonce); err != nil {
-		return ClientResult{}, err
+	var nonce []byte
+	proof := cfg.PublicKey
+	if !legacy {
+		nonce = make([]byte, 32)
+		if _, err := rand.Read(nonce); err != nil {
+			return ClientResult{}, err
+		}
+		proof = bindingHash("Client-To-Server", nonce, cfg.PublicKey)
 	}
-	proof := security.client.wrap(bindingHash("Client-To-Server", nonce, cfg.PublicKey))
-	if err := writeTSRequest(conn, tsRequest{Version: 6, Tokens: []negoToken{{Token: auth}}, PubKeyAuth: proof, Nonce: nonce}); err != nil {
+	if err := writeTSRequest(conn, tsRequest{Version: 6, Tokens: []negoToken{{Token: auth}}, PubKeyAuth: security.client.wrap(proof), Nonce: nonce}); err != nil {
 		return ClientResult{}, err
 	}
 	reply, err := readTSRequest(conn)
 	if err != nil {
-		return ClientResult{}, err
+		// Servers without the errorCode field (CredSSP < 3) report a rejected
+		// AUTHENTICATE by dropping the TLS session instead.
+		return ClientResult{}, fmt.Errorf("after NTLM AUTHENTICATE (CredSSP %d, credentials or channel binding rejected): %w", challenge.Version, err)
 	}
 	if reply.Version != challenge.Version || len(reply.AuthInfo) != 0 {
 		return ClientResult{}, errors.New("unexpected CredSSP public-key reply")
@@ -245,7 +264,12 @@ func Client(conn io.ReadWriter, cfg ClientConfig) (ClientResult, error) {
 	if err != nil {
 		return ClientResult{}, err
 	}
-	if !hmac.Equal(plain, bindingHash("Server-To-Client", nonce, cfg.PublicKey)) {
+	want := bindingHash("Server-To-Client", nonce, cfg.PublicKey)
+	if legacy { // MS-CSSP 3.1.5: the server echoes the public key with its first byte incremented
+		want = append([]byte(nil), cfg.PublicKey...)
+		want[0]++
+	}
+	if !hmac.Equal(plain, want) {
 		return ClientResult{}, errors.New("server TLS public-key binding mismatch")
 	}
 	encoded, err := marshalPasswordCreds(cfg.Domain, cfg.User, cfg.Password)

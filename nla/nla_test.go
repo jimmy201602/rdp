@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -137,6 +138,91 @@ func TestServerRejectsUnknownUserAndMismatchedBinding(t *testing.T) {
 	}
 	if out := <-done; out.err == nil || !strings.Contains(out.err.Error(), "public-key binding") {
 		t.Fatalf("server got %v", out.err)
+	}
+}
+
+// legacyServer speaks CredSSP version 2 like an unpatched Windows 7: no
+// nonce, pubKeyAuth is the raw public key and the reply echoes it with the
+// first byte incremented. It reports the delegated credentials it decrypts.
+func legacyServer(t *testing.T, srv net.Conn, version int, got chan<- string) {
+	t.Helper()
+	defer func() { _ = srv.Close() }()
+	_ = srv.SetDeadline(time.Now().Add(5 * time.Second))
+	first, err := readTSRequest(srv)
+	if err != nil {
+		return
+	}
+	st, err := ntlmChallenge(first.Tokens[0].Token, "CORP", "GW", time.Now())
+	if err != nil {
+		return
+	}
+	if err := writeTSRequest(srv, tsRequest{Version: version, Tokens: []negoToken{{Token: st.challenge}}}); err != nil {
+		return
+	}
+	second, err := readTSRequest(srv)
+	if err != nil {
+		return
+	}
+	v, err := st.verify(second.Tokens[0].Token, testBinding, lookupAlice)
+	if err != nil {
+		return
+	}
+	key, err := v.security.client.unwrap(second.PubKeyAuth)
+	if err != nil || len(second.Nonce) != 0 || !bytes.Equal(key, testKey) {
+		got <- fmt.Sprintf("pubKeyAuth %x nonce %x err %v", key, second.Nonce, err)
+		return
+	}
+	echo := append([]byte(nil), testKey...)
+	echo[0]++
+	if err := writeTSRequest(srv, tsRequest{Version: version, PubKeyAuth: v.security.server.wrap(echo)}); err != nil {
+		return
+	}
+	third, err := readTSRequest(srv)
+	if err != nil {
+		return
+	}
+	creds, err := v.security.client.unwrap(third.AuthInfo)
+	if err != nil {
+		return
+	}
+	got <- fmt.Sprintf("%x", creds)
+}
+
+func TestClientLegacyCredSSP(t *testing.T) {
+	// Default: version 2 is refused before any credentials are sent.
+	client, srv := net.Pipe()
+	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+	got := make(chan string, 1)
+	go legacyServer(t, srv, 2, got)
+	_, err := Client(client, clientConfig())
+	_ = client.Close()
+	if err == nil || !strings.Contains(err.Error(), "version 2") {
+		t.Fatalf("default client: %v, want version refusal", err)
+	}
+
+	// Opted in: the exchange completes with the v2 public-key echo.
+	client, srv = net.Pipe()
+	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+	go legacyServer(t, srv, 2, got)
+	cfg := clientConfig()
+	cfg.MinVersion = 2
+	r, err := Client(client, cfg)
+	_ = client.Close()
+	if err != nil || r.Version != 2 {
+		t.Fatalf("legacy client: %+v %v", r, err)
+	}
+	want, _ := marshalPasswordCreds("CORP", "alice", "s3cret")
+	if creds := <-got; creds != fmt.Sprintf("%x", want) {
+		t.Fatalf("server decrypted %s", creds)
+	}
+
+	// Opted in but the server is current: the nonce-bound proof is still used.
+	client, done := runServer(t, serverConfig())
+	if r, err := Client(client, cfg); err != nil || r.Version != 6 {
+		t.Fatalf("legacy-enabled client against v6 server: %+v %v", r, err)
+	}
+	if out := <-done; out.err != nil {
+		t.Fatal(out.err)
 	}
 }
 

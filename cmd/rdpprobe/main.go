@@ -76,6 +76,7 @@ type report struct {
 
 func main() {
 	nla := flag.Bool("nla", false, "require CredSSP 5/6 with NTLMv2; all stages after tls delegate credentials")
+	credsspLegacy := flag.Bool("credssp-legacy", false, "with -nla: also accept CredSSP 2-4 (unpatched Windows 7 / 2008 R2, CVE-2018-0886); pair with -pin")
 	addr := flag.String("addr", "", "server address host:port (required)")
 	serverName := flag.String("server-name", "", "name used for SNI and certificate verification (default: host from -addr)")
 	caFile := flag.String("ca", "", "PEM file with trusted root certificate(s); default uses system roots")
@@ -115,7 +116,7 @@ func main() {
 	if !ok {
 		fatal(fmt.Errorf("-min-tls: unknown version %q", *minTLS))
 	}
-	opts := transport.Options{NLA: *nla, ServerName: *serverName, PinSHA256: *pin, MinTLSVersion: minVersion, Cookie: *cookie, Timeout: *timeout, ClientName: *clientName,
+	opts := transport.Options{NLA: *nla, LegacyCredSSP: *credsspLegacy, ServerName: *serverName, PinSHA256: *pin, MinTLSVersion: minVersion, Cookie: *cookie, Timeout: *timeout, ClientName: *clientName,
 		UserName: *user, Domain: *domain, StopAfter: *stage, Observe: *observe, Render: *observe != 0}
 	if *passwordEnv != "" {
 		if *user == "" {
@@ -210,6 +211,9 @@ func main() {
 	if reached >= transport.StageIndex(transport.StageTLS) {
 		rep.TLSVersion = transport.TLSVersionString(res.TLSVersion)
 		rep.CipherSuite = tls.CipherSuiteName(res.CipherSuite)
+		if res.TLS10StreamCipher {
+			rep.CipherSuite += " (RC4 retry: TLS 1.0 CredSSP needs one record per TSRequest)"
+		}
 		rep.PeerSubject = res.PeerSubject
 		rep.PeerSHA256 = res.PeerSHA256
 		rep.PeerNotAfter = res.PeerNotAfter.UTC().Format(time.RFC3339)

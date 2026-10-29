@@ -25,6 +25,7 @@ const (
 	sourceDescriptor           = "RDP"
 	maxJoinPDUs                = 64
 	maxFinalizationPDUs        = 16
+	maxPointerCacheSize uint16 = 25 // clients keep the smaller of ours and theirs
 	maxBitmapPayload           = 16 << 10
 	bufferSize                 = 16 << 10
 )
@@ -525,20 +526,39 @@ func (s *session) license(context.Context) error {
 
 // --- Capabilities -------------------------------------------------------------
 
+// serverCapabilities advertises every optional feature a later Demand Active
+// (from a relayed target after Deactivate All) might rely on. Clients fold each
+// Demand Active into their running settings and never re-enable a feature the
+// first one left out: fast-path output, refresh rect / suppress output, the
+// 32 order flags, cache-bitmap v3 / frame markers, drawing flags and horizontal
+// wheel all stay off for the rest of the connection if omitted here. Declaring
+// them is harmless for the built-in desktop, which only sends bitmap updates.
 func (s *session) serverCapabilities() []wire.CapabilitySet {
 	w, h := s.peer.DesktopWidth, s.peer.DesktopHeight
 	var orders wire.OrderCapability
-	orders.OrderFlags = wire.OrderNegotiateOrderSupport | wire.OrderZeroBoundsDeltasSupport
+	orders.OrderFlags = wire.OrderNegotiateOrderSupport | wire.OrderZeroBoundsDeltasSupport |
+		wire.OrderColorIndexSupport | wire.OrderFlagsExtraFlags
+	orders.OrderSupportExFlags = wire.OrderSupportExCacheBitmapV3 | wire.OrderSupportExAltSecFrameMarker
+	for i := range orders.OrderSupport {
+		orders.OrderSupport[i] = 1
+	}
 	orders.TextANSICodePage = 1252
 	return []wire.CapabilitySet{
 		wire.GeneralCapability{
 			OSMajorType: wire.OSMajorTypeUnix, OSMinorType: wire.OSMinorTypeUnspecified,
-			ExtraFlags: wire.GeneralLongCredentialsSupported | wire.GeneralNoBitmapCompressionHdr,
+			ExtraFlags: wire.GeneralLongCredentialsSupported | wire.GeneralNoBitmapCompressionHdr |
+				wire.GeneralFastPathOutputSupported | wire.GeneralAutoReconnectSupported | wire.GeneralEncSaltedChecksum,
+			RefreshRectSupport: 1, SuppressOutputSupport: 1,
 		}.Set(),
-		wire.BitmapCapability{PreferredBitsPerPixel: 24, DesktopWidth: w, DesktopHeight: h, DesktopResizeFlag: 1, MultipleRectangleSupport: 1}.Set(),
+		wire.BitmapCapability{
+			PreferredBitsPerPixel: 24, DesktopWidth: w, DesktopHeight: h, DesktopResizeFlag: 1,
+			DrawingFlags:             wire.DrawAllowDynamicColorFidelity | wire.DrawAllowColorSubsampling | wire.DrawAllowSkipAlpha,
+			MultipleRectangleSupport: 1,
+		}.Set(),
 		orders.Set(),
-		wire.PointerCapability{ColorPointerFlag: 1, ColorPointerCacheSize: wire.DefaultPointerCacheSize, PointerCacheSize: wire.DefaultPointerCacheSize}.Set(),
-		wire.InputCapability{InputFlags: wire.InputFlagScancodes | wire.InputFlagMouseX | wire.InputFlagUnicode}.Set(),
+		wire.PointerCapability{ColorPointerFlag: 1, ColorPointerCacheSize: maxPointerCacheSize, PointerCacheSize: maxPointerCacheSize}.Set(),
+		wire.InputCapability{InputFlags: wire.InputFlagScancodes | wire.InputFlagMouseX | wire.InputFlagFastPathInput |
+			wire.InputFlagUnicode | wire.InputFlagFastPathInput2 | wire.InputFlagMouseHWheel}.Set(),
 		wire.ShareCapability{NodeID: wire.ServerChannelID}.Set(),
 		wire.FontCapabilitySet(),
 		wire.ColorCacheCapabilitySet(),
@@ -657,6 +677,10 @@ func (s *session) output(context.Context) error {
 			ptr = p
 		}
 	}
+	return s.sendPointer(ptr)
+}
+
+func (s *session) sendPointer(ptr *Pointer) error {
 	if err := ptr.validate(); err != nil {
 		return err
 	}
@@ -673,19 +697,27 @@ func (s *session) output(context.Context) error {
 	return s.writeIO(pdu)
 }
 
-// sendFrame pushes the frame as uncompressed bitmap rectangles, each at
-// most maxBitmapPayload bytes.
+// sendFrame pushes the whole frame.
 func (s *session) sendFrame() error {
-	f := s.frame
-	w, h := int(f.Width), int(f.Height)
-	stride := w * int(s.bpp) / 8
+	return s.sendRegion(s.frame, 0, 0, int(s.frame.Width), int(s.frame.Height))
+}
+
+// sendRegion pushes a clipped, 4-pixel-aligned region of f as uncompressed
+// bitmap rectangles, each at most maxBitmapPayload bytes.
+func (s *session) sendRegion(f *Frame, x, y, w, h int) error {
+	x0, y0 := max(x, 0)&^3, max(y, 0)
+	x1, y1 := min((x+w+3)&^3, int(f.Width)), min(y+h, int(f.Height))
+	if x0 >= x1 || y0 >= y1 {
+		return nil
+	}
+	stride := (x1 - x0) * int(s.bpp) / 8
 	rowsPer := maxBitmapPayload / stride
 	if rowsPer < 1 {
 		rowsPer = 1
 	}
-	for y := 0; y < h; y += rowsPer {
-		y1 := min(y+rowsPer, h)
-		bd, err := wire.NewBitmapData(0, uint16(y), f.Width, uint16(y1-y), s.bpp, false, f.rows(y, y1, s.bpp))
+	for y := y0; y < y1; y += rowsPer {
+		yEnd := min(y+rowsPer, y1)
+		bd, err := wire.NewBitmapData(uint16(x0), uint16(y), uint16(x1-x0), uint16(yEnd-y), s.bpp, false, f.region(x0, y, x1, yEnd, s.bpp))
 		if err != nil {
 			return err
 		}

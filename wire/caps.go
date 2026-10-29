@@ -34,10 +34,21 @@ const (
 	OrderSolidPatternBrushOnly   uint16 = 0x0040
 	OrderFlagsExtraFlags         uint16 = 0x0080
 
-	InputFlagScancodes     uint16 = 0x0001
-	InputFlagMouseX        uint16 = 0x0004
-	InputFlagFastPathInput uint16 = 0x0008
-	InputFlagUnicode       uint16 = 0x0010
+	// orderSupportExFlags (TS_ORDER_CAPABILITYSET), valid with OrderFlagsExtraFlags.
+	OrderSupportExCacheBitmapV3     uint16 = 0x0002
+	OrderSupportExAltSecFrameMarker uint16 = 0x0004
+
+	// drawingFlags (TS_BITMAP_CAPABILITYSET).
+	DrawAllowDynamicColorFidelity uint8 = 0x02
+	DrawAllowColorSubsampling     uint8 = 0x04
+	DrawAllowSkipAlpha            uint8 = 0x08
+
+	InputFlagScancodes      uint16 = 0x0001
+	InputFlagMouseX         uint16 = 0x0004
+	InputFlagFastPathInput  uint16 = 0x0008
+	InputFlagUnicode        uint16 = 0x0010
+	InputFlagFastPathInput2 uint16 = 0x0020
+	InputFlagMouseHWheel    uint16 = 0x0100
 
 	controlPriorityNever uint16 = 0x0002
 	soundFlagBeeps       uint16 = 0x0001
@@ -143,11 +154,12 @@ func DecodeBitmapCapability(s CapabilitySet) (BitmapCapability, error) {
 // OrderCapability is TS_ORDER_CAPABILITYSET (2.2.7.1.3). OrderSupport holds
 // the 32 TS_NEG_*_INDEX flags.
 type OrderCapability struct {
-	OrderFlags       uint16
-	OrderSupport     [32]byte
-	TextFlags        uint16
-	DesktopSaveSize  uint32
-	TextANSICodePage uint16
+	OrderFlags          uint16
+	OrderSupport        [32]byte
+	TextFlags           uint16
+	OrderSupportExFlags uint16
+	DesktopSaveSize     uint32
+	TextANSICodePage    uint16
 }
 
 func (o OrderCapability) Set() CapabilitySet {
@@ -160,7 +172,7 @@ func (o OrderCapability) Set() CapabilitySet {
 	binary.LittleEndian.PutUint16(d[30:], o.OrderFlags)
 	copy(d[32:64], o.OrderSupport[:])
 	binary.LittleEndian.PutUint16(d[64:], o.TextFlags)
-	binary.LittleEndian.PutUint16(d[66:], 0) // orderSupportExFlags
+	binary.LittleEndian.PutUint16(d[66:], o.OrderSupportExFlags)
 	binary.LittleEndian.PutUint32(d[72:], o.DesktopSaveSize)
 	binary.LittleEndian.PutUint16(d[80:], o.TextANSICodePage)
 	return CapabilitySet{Type: CapsTypeOrder, Data: d}
@@ -175,6 +187,7 @@ func DecodeOrderCapability(s CapabilitySet) (OrderCapability, error) {
 	o.OrderFlags = binary.LittleEndian.Uint16(d[30:])
 	copy(o.OrderSupport[:], d[32:64])
 	o.TextFlags = binary.LittleEndian.Uint16(d[64:])
+	o.OrderSupportExFlags = binary.LittleEndian.Uint16(d[66:])
 	o.DesktopSaveSize = binary.LittleEndian.Uint32(d[72:])
 	o.TextANSICodePage = binary.LittleEndian.Uint16(d[80:])
 	return o, nil
@@ -249,6 +262,22 @@ func (p PointerCapability) Set() CapabilitySet {
 	binary.LittleEndian.PutUint16(d[2:], p.ColorPointerCacheSize)
 	binary.LittleEndian.PutUint16(d[4:], p.PointerCacheSize)
 	return CapabilitySet{Type: CapsTypePointer, Data: d}
+}
+
+// DecodePointerCapability parses a pointer capability set. The pre-5.0 form
+// omits pointerCacheSize; it then defaults to colorPointerCacheSize.
+func DecodePointerCapability(s CapabilitySet) (PointerCapability, error) {
+	var p PointerCapability
+	if s.Type != CapsTypePointer || len(s.Data) < 4 {
+		return p, fmt.Errorf("%w: pointer capability set type 0x%04x, %d bytes", ErrShare, s.Type, len(s.Data))
+	}
+	p.ColorPointerFlag = binary.LittleEndian.Uint16(s.Data)
+	p.ColorPointerCacheSize = binary.LittleEndian.Uint16(s.Data[2:])
+	p.PointerCacheSize = p.ColorPointerCacheSize
+	if len(s.Data) >= 6 {
+		p.PointerCacheSize = binary.LittleEndian.Uint16(s.Data[4:])
+	}
+	return p, nil
 }
 
 func u16Set(typ uint16, values ...uint16) CapabilitySet {

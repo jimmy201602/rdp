@@ -1,4 +1,4 @@
-# 验证环境与结果（G1 协商 + TLS，G2 第一段 MCS/GCC + Channel Join，G2 第二段 Client Info → Font Map，G2 第三段 Font Map 后观察，G2 第四段位图解码，G2 第五段 Fast-Path 输出 + 指针渲染，G3-1 服务端角色 + xfreerdp 真实客户端，G3-3 网关 xfreerdp → rdpgw → xrdp，G3-4 静态虚拟通道透传 + 后端 NLA：xfreerdp → rdpgw → Windows 7 / Server 2016，G3-5 前端 NLA：xfreerdp /sec:nla → rdpgw CredSSP 服务端 → Windows 7 / Server 2016）
+# 验证环境与结果（G1 协商 + TLS，G2 第一段 MCS/GCC + Channel Join，G2 第二段 Client Info → Font Map，G2 第三段 Font Map 后观察，G2 第四段位图解码，G2 第五段 Fast-Path 输出 + 指针渲染，G3-1 服务端角色 + xfreerdp 真实客户端，G3-3 网关 xfreerdp → rdpgw → xrdp，G3-4 静态虚拟通道透传 + 后端 NLA：xfreerdp → rdpgw → Windows 7 / Server 2016，G3-5 前端 NLA：xfreerdp /sec:nla → rdpgw CredSSP 服务端 → Windows 7 / Server 2016，G3-6 登录表单：xfreerdp → rdpgw -login-form（表单里输入目标）→ Windows 7 / Server 2016）
 
 本文记录隔离 xrdp 互操作环境的搭建方式、执行命令和实际结果。结论覆盖 TPKT/X.224/RDP 安全协商、TLS 服务器认证、MCS Connect-Initial/Response 与 GCC Basic Settings Exchange（含协商结果重确认）、Erect Domain / Attach User / Channel Join（用户通道 + I/O 通道）、Client Info、MS-RDPELE 许可、Demand/Confirm Active 能力交换和 Synchronize/Control/Font List/Font Map 连接收尾。G2 第三段在 Font Map 后保持连接读取服务端输出（Slow-Path Update / Pointer / Save Session Info 分类计数）；G2 第四段把 Bitmap Update 解码（Interleaved RLE）到帧缓冲并导出 PNG，在 xrdp 上得到完整的登录界面和 xfce 桌面画面（见 5.5）；G2 第五段声明 FASTPATH_OUTPUT_SUPPORTED，读循环同时处理 TPKT 与 fast-path PDU，并把指针更新解码成 RGBA 光标（见 5.6）。G3-1 反向实现服务端角色（`server` 包 / `rdpserve`），用 Go 客户端回环 e2e 和 VM 上的真实 xfreerdp 2.6.1 + Xvfb 验证了协商、TLS、Client Info 策略、许可、能力交换、收尾和位图/光标输出（见 5.7）。orders、输入、虚拟通道未实现；带测试账号时 xrdp 侧日志记录登录成功并启动了 Xorg 会话，但 xrdp 不发 Save Session Info，协议层没有登录通知（见 5.4）。
 
@@ -257,6 +257,21 @@ VM 真实链路：Ubuntu 22.04 + Xvfb :99，xfreerdp 2.6.1 → `rdpgw 127.0.0.1:
 
 说明：`bound=false` 表示 xfreerdp 3.31 未在 NTLMv2 响应里放非零 MsvAvChannelBindings（服务端只在客户端给出时强制比对；公钥绑定 nonce 证明仍然校验），`spnego=false` 表示裸 NTLMSSP。SPNEGO/mechListMIC 路径（mstsc）只有单测，按 FreeRDP 3.31 `negotiate.c` acceptor 行为建模（首选机制非 NTLM 时 request-mic；MIC 交换后重置 RC4 流、序号不重置），未对真实 mstsc 验证。
 
+### 5.11 G3-6（2026-10-29，登录表单：本机 xfreerdp → rdpgw -login-form → 用户在表单中输入目标 → Windows Server 2016 / Windows 7）
+
+本地 macOS：`gofmt`/`go vet`/`go test ./...`/`go test -race ./server ./gateway ./wire` 通过。新增单测：`form`（字段编辑/焦点/提交/取消状态机、点阵字体渲染）、`server.TestHandlerActivateInputAndReactivate`（激活 → 位图/指针 → 输入 → Deactivate All → 再激活）、`server.TestServerCapabilitiesKeepRelayFeaturesNegotiable`、`gateway.TestFormRetryThenRelay`（错误密码保留表单，正确密码 → Deactivate All → 目标 Demand Active → 终结 → relay，陈旧 Enter 释放被丢弃，密码不进日志）、`TestFormAttemptsExhaustedAndEscape`、`TestFormEmptyPasswordIsNotAnAttempt`、`TestDescribeDialError`、`transport.TestTLS10CredSSPRetriesWithStreamCipher`/`TestTLS10WithoutNLAKeepsBlockCipher`、`nla.TestClientLegacyCredSSP`。
+
+真实链路：macOS + XQuartz，xfreerdp 3.31.1（`/cert:ignore`，默认协商）→ 本机 `rdpgw -listen 127.0.0.1:33892 -login-form -allow-target 192.0.2.0/24 -target-pin 192.0.2.10=…,192.0.2.20=… -target-min-tls 1.0 -target-nla -target-credssp-legacy -json`，用户在 FreeRDP 窗口里的表单输入目标地址 / 用户名 / 密码。
+
+| 用例 | 结果 |
+|---|---|
+| 修复前：表单 → 192.0.2.20（Server 2016，正确凭据） | 目标 `licensed via logon form … relaying`，但 relay 结束行 `target 8 pdus + 0 fast-path`，客户端一直停在表单画面。原因：表单那份 Demand Active 未声明 fast-path 输出 / orders 等，FreeRDP 把后续 Windows 的 Demand Active 与之“与”合并后向 Windows 确认了一个没有 fast-path 输出、没有 orders 的能力集，Windows 不再出图 |
+| 修复后：表单 → 192.0.2.20，正确凭据 | 用户确认进入 Server 2016 桌面；relay `client 5 pdus + 1211 fast-path, target 8 pdus + 1075 fast-path, channels map[cliprdr:5 drdynvc:859 rdpdr:13], reactivations 0, form_attempts 1` |
+| 表单 → 192.0.2.10（Windows 7 SP1，`-target-nla`） | 修复前 `CredSSP authentication failed: remote error: tls: internal error`；表单 Fail 清空密码后 xfreerdp 重复的 Enter 又触发两次 `NLA requires a user and password`，三次尝试立刻用完 → 现在空密码不计尝试。`rdpprobe -nla -min-tls 1.0 -pin …` 定位：TLS 1.0 CBC 下第一份 TSRequest 之后即收到 alert（与密码无关）；改 RC4 重连后 Win7 回 CHALLENGE 但 CredSSP 版本为 2；加 `-credssp-legacy` 后 `mcs connect ok → client info ok (autologon) → license ok (valid-client)`，`tls: TLS_RSA_WITH_RC4_128_SHA (RC4 retry …)` |
+| 修复后：表单 → 192.0.2.10，正确凭据，网关带 `-target-credssp-legacy` | 用户确认进入 Windows 7 桌面；网关 `target 192.0.2.10:3389 licensed via logon form (user channel 1008, channels [rdpdr rdpsnd cliprdr drdynvc]), relaying`，relay `client 10 pdus + 47 fast-path, target 14 pdus + 85 fast-path, channels map[cliprdr:5 drdynvc:4 rdpdr:13], dropped channels map[], reactivations 1, form_attempts 1`（Win7 照例在登录后再发一次真实 Deactivate All，网关重激活正常；被过滤能力 22/23/24/25/28/29 与 G3-4 一致） |
+
+说明：本机 Homebrew xfreerdp 3.31.1（OpenSSL 3）无法与仅 TLS 1.0 的 Win7 完成握手（`/tls:seclevel:0`、`/tls:enforce:1.0` 均 `BIO_do_handshake failed`），因此 Win7 的 NLA 对照只能用 `rdpprobe`。RC4 回退仅在 NLA 且已协商出 TLS 1.0 CBC 时触发，TLS-only 路径不变（TPKT 在多条记录间重组，不受拆分影响）。
+
 ## 6. 本轮验证不覆盖
 
 - 用户认证结果的协议层判定：无 NLA/CredSSP；xrdp 侧日志确认 INFO_AUTOLOGON 凭据登录成功并启动了 Xorg 会话，但观察窗口内没有收到任何 Save Session Info，探测器不能自行判定登录结果；Save Session Info / Set Error Info 解码只经单元测试验证。错误密码用例未跑（xrdp 失败时同样只在服务端日志体现）。
@@ -265,5 +280,6 @@ VM 真实链路：Ubuntu 22.04 + Xvfb :99，xfreerdp 2.6.1 → `rdpgw 127.0.0.1:
 - 静态虚拟通道只做透传（不解析 cliprdr/rdpdr/rdpsnd/drdynvc 协议，不做通道级策略如只读剪贴板）、消息通道、多传输通道；服务端分配的通道数与请求不符会被拒绝。
 - 公网目标、Standard RDP Security 服务器（探测器按设计拒绝）；Windows 目标只测了 Windows 7 SP1（TLS 1.0）与 Server 2016（NLA）各一台，均为自签名证书 + `-pin`，未测域账户 / Kerberos、HYBRID_EX、CredSSP 服务端要求 Early User Auth、NTLM 被禁用（只允许 Kerberos）的主机。
 - 网关：前端 NLA 只对 xfreerdp 3.31 的裸 NTLMSSP 令牌实测，mstsc 的 SPNEGO 包装只有单测；不做 Kerberos、HYBRID_EX / Early User Auth、智能卡凭据、NTLM 账户锁定/口令过期等状态码（失败一律 STATUS_LOGON_FAILURE）；`-nla-users` 为明文口令文件，没有哈希存储；目标证书必须经 `-target-ca`/系统根或 `-target-pin` 叶证书指纹验证，没有跳过选项；被过滤的能力（codecs/Surface Commands/Frame Ack/RAIL 等）意味着不支持 RemoteFX/GFX、RemoteApp；输入只透传并计数，不做键盘布局改写或策略拦截；重激活（Deactivate All）、客户端 Shutdown Request、多会话并发上限、握手超时只在单测/代码路径上；真实 Windows 目标与 mstsc 客户端未测。
-- 服务端角色：只对 xfreerdp 2.6.1（TLS）和 3.31（NLA，经网关）验证，mstsc/Windows 客户端、多显示器、Auto-Reconnect、重激活（Deactivate All → 新 Demand Active）、Shutdown Request 真实路径、空闲超时、并发上限（只有单元/手工路径）未在真实客户端上验证；位图只发未压缩矩形，没有压缩编码、fast-path 输出、orders；输入被丢弃；不连接上游目标。
+- 服务端角色：只对 xfreerdp 2.6.1（TLS）和 3.31（NLA，经网关）验证，mstsc/Windows 客户端、多显示器、Auto-Reconnect、Shutdown Request 真实路径、空闲超时、并发上限（只有单元/手工路径）未在真实客户端上验证；重激活只以“网关表单 → Deactivate All → 目标 Demand Active”这一种形态在 xfreerdp 3.31 上验证；位图只发未压缩矩形，没有压缩编码、fast-path 输出、orders（Demand Active 里声明它们只是为了保住后续目标的协商）。
+- 登录表单：只有中文提示、无 IME；表单画面不经压缩；`-allow-target` 只按地址做策略，没有按用户/时间的规则；`-target-credssp-legacy` 放弃 CredSSP 5/6 的 nonce 公钥绑定（CVE-2018-0886），只在配合 `-target-pin` 时才有意义，且 RC4 回退让 Win7 会话全程使用 RC4——这两项都是对 EOL 主机的兼容，不是推荐配置。
 - 证书验证关闭或降级路径：不存在该选项，也不计划提供。

@@ -39,6 +39,11 @@ type Options struct {
 	// NLA requires PROTOCOL_HYBRID and CredSSP 5/6 with NTLMv2. No fallback
 	// to TLS-only is allowed. Probe still stops before authentication.
 	NLA bool
+	// LegacyCredSSP also accepts CredSSP versions 2-4 from the server
+	// (unpatched Windows 7 / 2008 R2; the public-key binding is then not
+	// nonce-bound, CVE-2018-0886). Only meaningful with NLA and best combined
+	// with PinSHA256.
+	LegacyCredSSP bool
 	// ServerName is used for SNI and certificate verification. Defaults to the
 	// host part of the address.
 	ServerName string
@@ -138,9 +143,12 @@ type Result struct {
 	NegotiationFlags uint8
 	TLSVersion       uint16
 	CipherSuite      uint16
-	PeerSubject      string
-	PeerSHA256       string // hex SHA-256 of the leaf certificate
-	PeerNotAfter     time.Time
+	// TLS10StreamCipher is set when the TLS session was redone with RC4 so
+	// that CredSSP works against a TLS 1.0-only host (see needsLegacyStreamCipher).
+	TLS10StreamCipher bool
+	PeerSubject       string
+	PeerSHA256        string // hex SHA-256 of the leaf certificate
+	PeerNotAfter      time.Time
 
 	// Basic Settings Exchange.
 	ServerVersion           uint32
@@ -218,6 +226,46 @@ func secureTransport(ctx context.Context, address string, opts Options) (*tls.Co
 		serverName = host
 	}
 
+	tlsConn, res, err := connectTLS(ctx, address, serverName, opts, nil)
+	if err != nil {
+		return nil, res, err
+	}
+	if opts.NLA && needsLegacyStreamCipher(tlsConn.ConnectionState()) {
+		_ = tlsConn.Close()
+		tlsConn, res, err = connectTLS(ctx, address, serverName, opts, legacyTLS10CipherSuites)
+		if err != nil {
+			return nil, res, fmt.Errorf("retry with RC4 for TLS 1.0 CredSSP: %w", err)
+		}
+		res.TLS10StreamCipher = true
+	}
+	return tlsConn, res, nil
+}
+
+// legacyTLS10CipherSuites are offered only on the CredSSP retry below.
+var legacyTLS10CipherSuites = []uint16{tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA, tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA, tls.TLS_RSA_WITH_RC4_128_SHA}
+
+// needsLegacyStreamCipher reports whether CredSSP would fail on this session:
+// Go splits every TLS 1.0 CBC application-data write into a 1-byte record
+// followed by the rest (BEAST countermeasure, not configurable), and the
+// CredSSP reader in Windows 7 / 2008 R2 drops the connection with a TLS
+// internal_error alert when a TSRequest does not start a record. The plain
+// RDP path is unaffected because TPKT framing is reassembled across records.
+// Those hosts only speak TLS 1.0, so a stream cipher (RC4) is the only way
+// to keep each TSRequest in one record.
+func needsLegacyStreamCipher(state tls.ConnectionState) bool {
+	if state.Version != tls.VersionTLS10 {
+		return false
+	}
+	for _, s := range legacyTLS10CipherSuites {
+		if state.CipherSuite == s {
+			return false
+		}
+	}
+	return true
+}
+
+func connectTLS(ctx context.Context, address, serverName string, opts Options, suites []uint16) (*tls.Conn, Result, error) {
+	var res Result
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
@@ -244,12 +292,16 @@ func secureTransport(ctx context.Context, address string, opts Options) (*tls.Co
 	res.Stage = StageNegotiation
 
 	cfg := &tls.Config{
-		ServerName: serverName,
-		RootCAs:    opts.RootCAs,
-		MinVersion: tls.VersionTLS12,
+		ServerName:   serverName,
+		RootCAs:      opts.RootCAs,
+		MinVersion:   tls.VersionTLS12,
+		CipherSuites: suites,
 	}
 	if opts.MinTLSVersion != 0 {
 		cfg.MinVersion = opts.MinTLSVersion
+	}
+	if suites != nil {
+		cfg.MaxVersion = tls.VersionTLS10
 	}
 	if pin := strings.ToLower(strings.ReplaceAll(opts.PinSHA256, ":", "")); pin != "" {
 		cfg.InsecureSkipVerify = true // the pin below is the only check

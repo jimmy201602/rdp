@@ -40,13 +40,14 @@ var (
 
 // Target is the backend a Route decision points to.
 type Target struct {
-	NLA        bool           // require CredSSP/NTLMv2 towards the target (independent of front-end NLA)
-	Address    string         // host:port
-	ServerName string         // TLS name to verify (default: host of Address)
-	RootCAs    *x509.CertPool // nil: system roots
-	PinSHA256  string         // hex SHA-256 of the target leaf certificate; replaces chain/name verification (self-signed RDP hosts)
-	MinTLS     uint16         // lowest TLS version accepted from the target (0: TLS 1.2; Windows 7 needs tls.VersionTLS10)
-	Timeout    time.Duration  // backend handshake budget (default 20s)
+	NLA           bool           // require CredSSP/NTLMv2 towards the target (independent of front-end NLA)
+	LegacyCredSSP bool           // with NLA: also accept CredSSP 2-4 (unpatched Windows 7 / 2008 R2, CVE-2018-0886); pair with PinSHA256
+	Address       string         // host:port
+	ServerName    string         // TLS name to verify (default: host of Address)
+	RootCAs       *x509.CertPool // nil: system roots
+	PinSHA256     string         // hex SHA-256 of the target leaf certificate; replaces chain/name verification (self-signed RDP hosts)
+	MinTLS        uint16         // lowest TLS version accepted from the target (0: TLS 1.2; Windows 7 needs tls.VersionTLS10)
+	Timeout       time.Duration  // backend handshake budget (default 20s)
 }
 
 // Config configures a Gateway.
@@ -55,8 +56,11 @@ type Config struct {
 	TLS *tls.Config
 	// Route decides, for a peer (no password), which target it may reach.
 	// Returning an error denies the client with
-	// ERRINFO_SERVER_DENIED_CONNECTION. Required.
+	// ERRINFO_SERVER_DENIED_CONNECTION. Required unless Form is set.
 	Route func(ctx context.Context, p server.Peer) (Target, error)
+	// Form, when set, shows every client an interactive logon form and
+	// dials the server the user typed instead of calling Route.
+	Form *FormConfig
 	// NLA enables CredSSP on the front end (see server.Config.NLA): the
 	// identity proven by NTLMv2 reaches Route in Peer and the credentials
 	// the client delegated are what the target receives. RequireNLA refuses
@@ -77,6 +81,9 @@ type Config struct {
 	// Logf receives state transitions; credentials and keystrokes never
 	// appear.
 	Logf func(format string, args ...any)
+	// Trace additionally logs the type of every slow-path share PDU relayed
+	// in either direction (never their contents), for protocol debugging.
+	Trace bool
 	// OnSession reports every finished front-end connection.
 	OnSession func(s server.Summary)
 	// OnRelay reports every relayed session (after the target was dialed).
@@ -101,6 +108,8 @@ type Summary struct {
 	ChannelPDUs         map[string]int // relayed chunks per channel name (both directions)
 	DroppedChannels     map[string]int // chunks dropped on channels the policy refused
 	Reactivations       int
+	LoginForm           bool   // target and credentials came from the logon form
+	FormAttempts        int    // connection attempts made from the form (1 = first try)
 	End                 string // "client-closed", "target-closed", "canceled", "error"
 	Err                 error
 	Duration            time.Duration
@@ -132,7 +141,19 @@ type Gateway struct {
 
 // New validates cfg and builds the front-end server.
 func New(cfg Config) (*Gateway, error) {
-	if cfg.Route == nil {
+	if cfg.Form != nil {
+		if cfg.Form.Route == nil {
+			return nil, fmt.Errorf("%w: Form.Route policy required", server.ErrConfig)
+		}
+		fc := *cfg.Form
+		if fc.Attempts <= 0 {
+			fc.Attempts = 5
+		}
+		if fc.IdleTimeout <= 0 {
+			fc.IdleTimeout = 5 * time.Minute
+		}
+		cfg.Form = &fc
+	} else if cfg.Route == nil {
 		return nil, fmt.Errorf("%w: Route policy required", server.ErrConfig)
 	}
 	if cfg.AllowCapability == nil {
@@ -163,6 +184,9 @@ func New(cfg Config) (*Gateway, error) {
 func (g *Gateway) Serve(ctx context.Context, ln net.Listener) error { return g.srv.Serve(ctx, ln) }
 
 func (g *Gateway) handle(ctx context.Context, c *server.Conn) error {
+	if g.cfg.Form != nil {
+		return g.handleForm(ctx, c)
+	}
 	peer := c.Peer()
 	target, err := g.cfg.Route(ctx, peer)
 	if err != nil {
@@ -187,7 +211,7 @@ func (g *Gateway) handle(ctx context.Context, c *server.Conn) error {
 	channels := newChannelMap(c, g.cfg.AllowChannel)
 	creds := c.Credentials()
 	opts := transport.Options{
-		NLA: target.NLA, ServerName: target.ServerName, RootCAs: target.RootCAs, PinSHA256: target.PinSHA256, MinTLSVersion: target.MinTLS, Timeout: target.Timeout,
+		NLA: target.NLA, LegacyCredSSP: target.LegacyCredSSP, ServerName: target.ServerName, RootCAs: target.RootCAs, PinSHA256: target.PinSHA256, MinTLSVersion: target.MinTLS, Timeout: target.Timeout,
 		ClientName: peer.ClientName, DesktopWidth: peer.DesktopWidth, DesktopHeight: peer.DesktopHeight, ColorDepth: depth,
 		Channels: channels.defs,
 		Domain:   creds.Domain, UserName: creds.UserName, Password: creds.Password,
@@ -260,8 +284,15 @@ type relay struct {
 	client   *server.Conn
 	backend  *transport.Session
 	channels *channelMap
-	mu       sync.Mutex
-	sum      Summary
+	// dropInput discards client input until the client's Confirm Active
+	// has been relayed: after the logon form's Deactivate All, key releases
+	// already in flight must not reach the target before it is active.
+	dropInput bool
+	// firstServer is a target PDU already read (the Demand Active the logon
+	// form waited for) that targetToClient forwards before reading more.
+	firstServer *transport.PDU
+	mu          sync.Mutex
+	sum         Summary
 }
 
 type relayEnd struct {
@@ -308,6 +339,19 @@ func (r *relay) run(ctx context.Context) error {
 	return sum.Err
 }
 
+func (r *relay) trace(dir string, pduType uint16, data []byte) {
+	if !r.g.cfg.Trace {
+		return
+	}
+	if pduType == wire.PDUTypeData {
+		if sh, _, err := wire.DecodeShareData(data); err == nil {
+			r.g.cfg.Logf("%s: %s data pduType2 0x%02x (%d bytes)", r.sum.RemoteAddr, dir, sh.PDUType2, len(data))
+			return
+		}
+	}
+	r.g.cfg.Logf("%s: %s share control pduType %d (%d bytes)", r.sum.RemoteAddr, dir, pduType, len(data))
+}
+
 func closedErr(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed)
 }
@@ -328,6 +372,9 @@ func (r *relay) clientToTarget() relayEnd {
 			events, err := wire.DecodeFastPathInput(pdu.Data)
 			if err != nil {
 				return relayEnd{end: "error", err: fmt.Errorf("%w: %v", ErrRelay, err)}
+			}
+			if r.dropInput {
+				continue
 			}
 			r.countInput(events)
 			r.mu.Lock()
@@ -360,6 +407,9 @@ func (r *relay) clientToTarget() relayEnd {
 		if err != nil {
 			return relayEnd{end: "error", err: err}
 		}
+		if out == nil {
+			continue
+		}
 		r.mu.Lock()
 		r.sum.ClientPDUs++
 		r.mu.Unlock()
@@ -377,6 +427,7 @@ func (r *relay) rewriteClientPDU(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: client share control: %v", ErrRelay, err)
 	}
+	r.trace("client -> target", hdr.PDUType, data)
 	switch hdr.PDUType {
 	case wire.PDUTypeConfirmActive:
 		ca, err := wire.DecodeConfirmActive(data)
@@ -384,6 +435,7 @@ func (r *relay) rewriteClientPDU(data []byte) ([]byte, error) {
 			return nil, fmt.Errorf("%w: confirm active: %v", ErrRelay, err)
 		}
 		caps := r.filterCaps(ca.Capabilities)
+		r.dropInput = false
 		return wire.EncodeConfirmActive(ca.ShareID, r.backend.UserChannel(), strings.TrimRight(string(ca.SourceDescriptor), "\x00"), caps)
 	case wire.PDUTypeData:
 		sh, body, err := wire.DecodeShareData(data)
@@ -391,6 +443,9 @@ func (r *relay) rewriteClientPDU(data []byte) ([]byte, error) {
 			return nil, fmt.Errorf("%w: client share data: %v", ErrRelay, err)
 		}
 		if sh.PDUType2 == wire.PDUType2Input {
+			if r.dropInput {
+				return nil, nil
+			}
 			events, err := wire.DecodeInputPDU(body)
 			if err != nil {
 				return nil, fmt.Errorf("%w: %v", ErrRelay, err)
@@ -405,13 +460,20 @@ func (r *relay) rewriteClientPDU(data []byte) ([]byte, error) {
 }
 
 func (r *relay) targetToClient() relayEnd {
+	pending := r.firstServer
+	r.firstServer = nil
 	for {
-		pdu, err := r.backend.ReadPDU()
-		if err != nil {
-			if errors.Is(err, transport.ErrDisconnected) || closedErr(err) {
-				return relayEnd{end: "target-closed"}
+		var pdu transport.PDU
+		if pending != nil {
+			pdu, pending = *pending, nil
+		} else {
+			var err error
+			if pdu, err = r.backend.ReadPDU(); err != nil {
+				if errors.Is(err, transport.ErrDisconnected) || closedErr(err) {
+					return relayEnd{end: "target-closed"}
+				}
+				return relayEnd{end: "error", err: fmt.Errorf("target: %w", err)}
 			}
-			return relayEnd{end: "error", err: fmt.Errorf("target: %w", err)}
 		}
 		r.mu.Lock()
 		r.sum.ServerBytes += int64(len(pdu.Data))
@@ -458,6 +520,7 @@ func (r *relay) rewriteServerPDU(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: target share control: %v", ErrRelay, err)
 	}
+	r.trace("target -> client", hdr.PDUType, data)
 	switch hdr.PDUType {
 	case wire.PDUTypeDemandActive:
 		da, err := wire.DecodeDemandActive(data)

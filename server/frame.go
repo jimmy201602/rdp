@@ -60,16 +60,16 @@ func TestPattern(w, h uint16) *Frame {
 	return f
 }
 
-// rows converts frame rows [y0, y1) to a bottom-up TS_BITMAP_DATA payload
-// at the given depth (16, 24 or 32 bpp).
-func (f *Frame) rows(y0, y1 int, bpp uint16) []byte {
-	w := int(f.Width)
+// region converts the frame rectangle [x0, x1) x [y0, y1) to a bottom-up
+// TS_BITMAP_DATA payload at the given depth (16, 24 or 32 bpp).
+func (f *Frame) region(x0, y0, x1, y1 int, bpp uint16) []byte {
+	w := x1 - x0
 	bytesPP := int(bpp) / 8
 	stride := w * bytesPP
 	out := make([]byte, (y1-y0)*stride)
 	for y := y1 - 1; y >= y0; y-- {
 		dst := out[(y1-1-y)*stride:]
-		src := f.BGR[y*w*3:]
+		src := f.BGR[(y*int(f.Width)+x0)*3:]
 		for x := 0; x < w; x++ {
 			b, g, r := src[3*x], src[3*x+1], src[3*x+2]
 			switch bpp {
