@@ -155,6 +155,14 @@ func capabilityExchange(conn net.Conn, opts Options, res *Result) (wire.DemandAc
 	}
 	demand, err := wire.DecodeDemandActive(data)
 	if err != nil {
+		// A server that denies the connection after licensing sends a Set
+		// Error Info PDU (Share Data) instead of Demand Active; surface
+		// the ERRINFO code rather than a share-PDU type mismatch.
+		if hdr, _, hErr := wire.DecodeShareControl(data); hErr == nil && hdr.PDUType == wire.PDUTypeData {
+			if _, dErr := wire.DecodeDataPDU(data); dErr != nil {
+				return demand, fmt.Errorf("demand active: %w", dErr)
+			}
+		}
 		return demand, fmt.Errorf("demand active: %w", err)
 	}
 	res.ShareID = demand.ShareID

@@ -42,3 +42,5 @@
 ## 本轮明确未实现
 
 NLA/CredSSP、Standard RDP Security 加密、图形编解码的其余部分（Font Map 之后只把 Bitmap Update 解码到帧缓冲、指针解码成光标：orders 不解析、Surface Commands 只计数、无 bitmap cache / RDPGFX / 编解码器、无 fast-path 输入）、输入、静态/动态虚拟通道数据、RemoteApp、录制回放、业务迁移。已实现部分到 Font Map 为止：`Probe` 到 TLS（不含协商结果重确认），`Connect` 到 Channel Join（含重确认，不发 Client Info），`Activate` 到 Font Map，`Options.Observe` 窗口内继续读取服务端输出（发 Client Info，仅在调用方给出密码时设 INFO_AUTOLOGON；用户认证由服务端在此之后处理，只有服务端发 Save Session Info / Set Error Info 时才能看到结果，xrdp 0.9.24 不发，见 docs/VALIDATION.md 5.4）。许可的 Platform Challenge / New License / Upgrade License 分支只经本地假服务器和公开样例验证。三者都不能据此宣称已经建立安全、已认证的完整 RDP 会话。
+
+G3-1 新增服务端角色（`server` 包、`cmd/rdpserve`）：按 MS-RDPBCGR 1.3.1.1 连接序列的服务端方向实现到 Font Map 及其后的 Bitmap Update / Pointer 推送；MCS Connect-Response 的 BER 编码以 MS-RDPBCGR 4.1.4 公开样例逐字节核对（规范整数编码 `02 03 00 ff f8`），Connect-Initial / CS_* 解码以 4.1.3 样例核对，Demand Active 编码以 4.1.12 样例往返核对。许可仅发 STATUS_VALID_CLIENT 错误告警（2.2.1.12.1.3），不签发许可、不实现 RDS 许可服务器；服务端不做 NLA/CredSSP、Standard RDP Security、输入处理、虚拟通道数据、orders、压缩位图编码、fast-path 输出、Server Redirection、Auto-Reconnect。授权策略完全由调用方回调决定，本包不保存凭据；上游目标代理（网关）属 G3-3，未实现。

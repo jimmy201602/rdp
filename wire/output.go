@@ -361,3 +361,104 @@ func decodePointer(typ uint16, rest []byte) (Pointer, error) {
 	}
 	return p, nil
 }
+
+// --- Server side -----------------------------------------------------------
+
+// NewBitmapData describes an uncompressed (or, with compressed set,
+// RLE-compressed, no compression header) bitmap rectangle for
+// EncodeBitmapUpdate. data must hold width*height*bytesPerPixel bytes when
+// not compressed; rows are bottom-up as in TS_BITMAP_DATA.
+func NewBitmapData(left, top, width, height, bpp uint16, compressed bool, data []byte) (BitmapData, error) {
+	switch bpp {
+	case 8, 15, 16, 24, 32:
+	default:
+		return BitmapData{}, fmt.Errorf("%w: bitsPerPixel %d", ErrShare, bpp)
+	}
+	if width == 0 || height == 0 {
+		return BitmapData{}, fmt.Errorf("%w: empty bitmap", ErrShare)
+	}
+	if !compressed {
+		if want := int(width) * int(height) * ((int(bpp) + 7) / 8); want != len(data) {
+			return BitmapData{}, fmt.Errorf("%w: %dx%dx%d needs %d bytes, got %d", ErrShare, width, height, bpp, want, len(data))
+		}
+	}
+	b := BitmapData{
+		DestLeft: left, DestTop: top, DestRight: left + width - 1, DestBottom: top + height - 1,
+		Width: width, Height: height, BitsPerPixel: bpp, Compressed: compressed,
+		DataLength: len(data), data: data,
+	}
+	if compressed {
+		b.Flags = BitmapCompression | BitmapNoCompressionHdr
+	}
+	return b, nil
+}
+
+// EncodeBitmapUpdate builds the body of a slow-path Update Data PDU
+// (TS_UPDATE_BITMAP_DATA, 2.2.9.1.1.3.1.2) for the given rectangles.
+func EncodeBitmapUpdate(rects []BitmapData) ([]byte, error) {
+	if len(rects) == 0 || len(rects) > 0xffff {
+		return nil, fmt.Errorf("%w: %d bitmap rectangles", ErrShare, len(rects))
+	}
+	out := binary.LittleEndian.AppendUint16(nil, UpdateTypeBitmap)
+	out = binary.LittleEndian.AppendUint16(out, uint16(len(rects)))
+	for _, b := range rects {
+		if len(b.data) > 0xffff {
+			return nil, fmt.Errorf("%w: bitmap data %d bytes too large", ErrShare, len(b.data))
+		}
+		for _, v := range []uint16{b.DestLeft, b.DestTop, b.DestRight, b.DestBottom, b.Width, b.Height, b.BitsPerPixel, b.Flags} {
+			out = binary.LittleEndian.AppendUint16(out, v)
+		}
+		out = binary.LittleEndian.AppendUint16(out, uint16(len(b.data)))
+		out = append(out, b.data...)
+	}
+	return out, nil
+}
+
+// EncodeUpdatePDU wraps an update body in a Share Data PDU (pduType2 Update)
+// from the server channel.
+func EncodeUpdatePDU(shareID uint32, body []byte) ([]byte, error) {
+	return EncodeShareData(shareID, ServerChannelID, PDUType2Update, body)
+}
+
+// EncodePointer builds the body of a slow-path Pointer Update PDU
+// (TS_POINTER_PDU, 2.2.9.1.1.4) from a Pointer; System, Position, Cached,
+// Color and New pointers are supported (Large needs the large pointer
+// capability and is refused).
+func EncodePointer(p Pointer) ([]byte, error) {
+	out := binary.LittleEndian.AppendUint16(nil, p.Type)
+	out = binary.LittleEndian.AppendUint16(out, 0) // pad2Octets
+	switch p.Type {
+	case PointerTypeSystem:
+		return binary.LittleEndian.AppendUint32(out, p.SystemType), nil
+	case PointerTypePosition:
+		out = binary.LittleEndian.AppendUint16(out, p.X)
+		return binary.LittleEndian.AppendUint16(out, p.Y), nil
+	case PointerTypeCached:
+		return binary.LittleEndian.AppendUint16(out, p.CacheIndex), nil
+	case PointerTypeColor, PointerTypeNew:
+		if p.Type == PointerTypeNew {
+			out = binary.LittleEndian.AppendUint16(out, p.XorBpp)
+		} else if p.XorBpp != 24 {
+			return nil, fmt.Errorf("%w: color pointer must be 24bpp", ErrShare)
+		}
+		if p.Width == 0 || p.Height == 0 || p.Width > 96 || p.Height > 96 || len(p.XorMask) > 0xffff || len(p.AndMask) > 0xffff {
+			return nil, fmt.Errorf("%w: pointer %dx%d masks %d/%d", ErrShare, p.Width, p.Height, len(p.XorMask), len(p.AndMask))
+		}
+		out = binary.LittleEndian.AppendUint16(out, p.CacheIndex)
+		out = binary.LittleEndian.AppendUint16(out, p.HotSpotX)
+		out = binary.LittleEndian.AppendUint16(out, p.HotSpotY)
+		out = binary.LittleEndian.AppendUint16(out, p.Width)
+		out = binary.LittleEndian.AppendUint16(out, p.Height)
+		out = binary.LittleEndian.AppendUint16(out, uint16(len(p.AndMask)))
+		out = binary.LittleEndian.AppendUint16(out, uint16(len(p.XorMask)))
+		out = append(out, p.XorMask...)
+		out = append(out, p.AndMask...)
+		return append(out, 0), nil // pad
+	}
+	return nil, fmt.Errorf("%w: pointer messageType 0x%04x cannot be encoded", ErrShare, p.Type)
+}
+
+// EncodePointerPDU wraps a pointer body in a Share Data PDU (pduType2 Pointer).
+func EncodePointerPDU(shareID uint32, body []byte) ([]byte, error) {
+	return EncodeShareData(shareID, ServerChannelID, PDUType2Pointer, body)
+}

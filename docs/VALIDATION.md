@@ -1,6 +1,6 @@
-# 验证环境与结果（G1 协商 + TLS，G2 第一段 MCS/GCC + Channel Join，G2 第二段 Client Info → Font Map，G2 第三段 Font Map 后观察，G2 第四段位图解码，G2 第五段 Fast-Path 输出 + 指针渲染）
+# 验证环境与结果（G1 协商 + TLS，G2 第一段 MCS/GCC + Channel Join，G2 第二段 Client Info → Font Map，G2 第三段 Font Map 后观察，G2 第四段位图解码，G2 第五段 Fast-Path 输出 + 指针渲染，G3-1 服务端角色 + xfreerdp 真实客户端）
 
-本文记录隔离 xrdp 互操作环境的搭建方式、执行命令和实际结果。结论覆盖 TPKT/X.224/RDP 安全协商、TLS 服务器认证、MCS Connect-Initial/Response 与 GCC Basic Settings Exchange（含协商结果重确认）、Erect Domain / Attach User / Channel Join（用户通道 + I/O 通道）、Client Info、MS-RDPELE 许可、Demand/Confirm Active 能力交换和 Synchronize/Control/Font List/Font Map 连接收尾。G2 第三段在 Font Map 后保持连接读取服务端输出（Slow-Path Update / Pointer / Save Session Info 分类计数）；G2 第四段把 Bitmap Update 解码（Interleaved RLE）到帧缓冲并导出 PNG，在 xrdp 上得到完整的登录界面和 xfce 桌面画面（见 5.5）；G2 第五段声明 FASTPATH_OUTPUT_SUPPORTED，读循环同时处理 TPKT 与 fast-path PDU，并把指针更新解码成 RGBA 光标（见 5.6）。orders、输入、虚拟通道未实现；带测试账号时 xrdp 侧日志记录登录成功并启动了 Xorg 会话，但 xrdp 不发 Save Session Info，协议层没有登录通知（见 5.4）。
+本文记录隔离 xrdp 互操作环境的搭建方式、执行命令和实际结果。结论覆盖 TPKT/X.224/RDP 安全协商、TLS 服务器认证、MCS Connect-Initial/Response 与 GCC Basic Settings Exchange（含协商结果重确认）、Erect Domain / Attach User / Channel Join（用户通道 + I/O 通道）、Client Info、MS-RDPELE 许可、Demand/Confirm Active 能力交换和 Synchronize/Control/Font List/Font Map 连接收尾。G2 第三段在 Font Map 后保持连接读取服务端输出（Slow-Path Update / Pointer / Save Session Info 分类计数）；G2 第四段把 Bitmap Update 解码（Interleaved RLE）到帧缓冲并导出 PNG，在 xrdp 上得到完整的登录界面和 xfce 桌面画面（见 5.5）；G2 第五段声明 FASTPATH_OUTPUT_SUPPORTED，读循环同时处理 TPKT 与 fast-path PDU，并把指针更新解码成 RGBA 光标（见 5.6）。G3-1 反向实现服务端角色（`server` 包 / `rdpserve`），用 Go 客户端回环 e2e 和 VM 上的真实 xfreerdp 2.6.1 + Xvfb 验证了协商、TLS、Client Info 策略、许可、能力交换、收尾和位图/光标输出（见 5.7）。orders、输入、虚拟通道未实现；带测试账号时 xrdp 侧日志记录登录成功并启动了 Xorg 会话，但 xrdp 不发 Save Session Info，协议层没有登录通知（见 5.4）。
 
 ## 1. 拓扑
 
@@ -38,6 +38,7 @@ Dockerfile 用 digest 固定基础镜像，apt 包未固定版本；重新构建
 | `testenv/xrdp/start-xrdp.sh` | 把 `/certs` 中的测试证书装入 `/etc/xrdp`，改 `xrdp.ini`：`security_layer=tls`、`ssl_protocols=TLSv1.2, TLSv1.3`、`certificate`/`key_file` 指向测试证书、关闭 syslog、开启控制台日志；若挂载了 `/account`，用 `useradd`/`chpasswd` 创建一次性测试账号（密码不打印）；启动 `xrdp-sesman` 和 `xrdp --nodaemon` |
 | `scripts/xrdp-env.sh start|stop` | 仅在 Linux 执行：生成一次性测试 CA 和 `localhost`/`127.0.0.1` 服务器证书（CA 7 天、服务器证书 2 天，位于 `.testenv/certs/`，umask 077），生成测试账号名 `rdptest`（`XRDP_TEST_USER` 可改）与 24 字节随机密码到 `.testenv/account/`，构建镜像，以 `--publish 127.0.0.1:$XRDP_PORT:3389`（默认 33890）、内存/CPU/PID 限制、只读挂载证书和账号目录、`rdp-kernel.test=true` 标签启动容器；`stop` 只删除带该标签的容器 |
 | `cmd/rdpprobe` | 探测器 CLI；`-ca` 指定信任的 PEM 根证书，`-server-name` 指定 SNI/校验名，`-stage tls|channel-join|client-info|license|capabilities|activated`（默认 channel-join）控制停止阶段，`-client-name` 设置 Client Core Data 中的客户端名，`-user`/`-domain`/`-password-env` 填 Client Info（密码只从环境变量读取，不出现在命令行、报告或日志；给出密码才设置 INFO_AUTOLOGON），`-observe <时长>`（仅配合 `-stage activated`，否则拒绝）在 Font Map 后继续读取服务端输出并计数（Update 类型、位图矩形/压缩/字节、orders 数、指针类型、Save Session Info、Set Error Info、Deactivate All 重激活次数）并把 Bitmap Update 解码到 `-stage` 所用桌面尺寸（1024x768）的帧缓冲（报告 `framebuffer:` 行 / JSON `observation.frame`：矩形数、RLE 数、裁剪数、写入像素、覆盖率、色深、脏区、解码错误、像素 SHA-256），`-png <文件>`（需 `-observe`）把帧缓冲写成 PNG（指针位置已知且可见时合成光标），`-cursor-png <文件>` 写当前光标形状；报告另有 `fast-path:` 行（fast-path PDU 数、各 updateCode 计数、分片重组数）和 `pointer:` 行（解码光标数、缓存命中/缺失、可见性、位置、当前光标尺寸/热点/色深/SHA-256、错误），JSON 为 `observation.fastpath_pdus/fastpath_updates/fragments/pointer`；`-timeout` 自动加上观察时长，`-json` 输出报告 |
+| `server` 包 / `cmd/rdpserve` | G3-1 服务端角色与验证 CLI：`rdpserve -listen 127.0.0.1:33891 -user demo -password-env RDP_DEMO_PASSWORD [-cert/-key] [-once] [-json]`；不给证书时生成临时自签名证书（仅测试）；`-json` 每个会话结束输出一行（remote/user/domain/client/stage/authorized/duration_ms/error，无密码）|
 | `bitmap` 包 | Interleaved RLE 解压、RGBA 帧缓冲、指针 XOR/AND 掩码解码与缓存、光标合成（单测 + fuzz），只依赖标准库与 `wire` |
 
 `.testenv/`（证书、测试账号）与 `.build/` 已在 `.gitignore` 中，不入库。
@@ -182,6 +183,21 @@ xrdp 侧日志（带凭据）：`xrdp.log` 记录 `sending login info to session
 
 说明：声明 FASTPATH_OUTPUT_SUPPORTED 后，xrdp 0.9.24 把 Synchronize 与全部指针更新改走 fast-path，位图更新仍走慢路径 Share Data（所以 `fast-path:` 只占 3/45、6/24）；没有分片（更新都很小）、没有压缩标志、没有 Surface Commands；xrdp 全程不发 Pointer Position，光标位置未知，`-png` 不合成光标，光标只经 `-cursor-png` 单独导出。两张光标图以肉眼核对（形状、热点、透明边）为准。
 
+### 5.7 G3-1（2026-10-29，服务端角色：Go 客户端回环 + xfreerdp 真实客户端）
+
+本地/VM：`gofmt`/`go vet` 通过；`wire` 新增 `server_test.go`（Connection Request 解码含 cookie / 无 RDP_NEG_REQ / 畸形拒绝，Connection Confirm 与 NEG_FAILURE 编码往返，MS-RDPBCGR 4.1.3 Connect-Initial 解码到 CS_CORE/CS_SECURITY/CS_NET 字段，4.1.4 Connect-Response 解码后重编码逐字节一致，自编 SC_* → ConferenceCreateResponse → Connect-Response 往返，Erect Domain / Attach User / Channel Join 请求解码与 Confirm/失败/DPU 编码，Client Info Unicode 带扩展段与 ANSI 最小包往返、许可头拒绝、截断拒绝，Demand Active 自编往返与 4.1.12 样例重编码一致，Deactivate All / Font Map / Set Error Info / Font List，Bitmap Update 与 5 类 Pointer 编码经既有解码器往返）；`licensing` 新增 `EncodeValidClientAlert` 经客户端状态机得到 `valid-client`；`server` 新增 `TestLoopbackActivationAndGraphics`（`transport.Activate` + `Observe/Render` 连到 `server.Serve`：PROTOCOL_SSL、ENCRYPTION_NONE、SC_CORE 重确认、valid-client、4 个收尾 PDU、`Peer` 字段、Bitmap Update 与 1 个 Color 指针、渲染帧缓冲 5 个采样点与服务端 `TestPattern` 逐像素一致、日志中不含密码、取消上下文后 `Serve` 返回且 `Summary.Authorized`）、`TestPolicyDenied`（客户端拿到 `ERRINFO_SERVER_DENIED_CONNECTION`，服务端 `Summary.Err` 为 `ErrDenied`）、`TestRefusesNonTLSClient`（仅 PROTOCOL_RDP → RDP_NEG_FAILURE SSL_REQUIRED_BY_SERVER）、`TestHandshakeTimeoutAndGarbage`（HTTP 请求 → `ErrProtocol`，无回包）、`TestNewRejectsBadConfig`；`go test -race ./server ./transport` 通过。`transport` 顺带修正：Demand Active 位置收到 Share Data（Set Error Info）时报告 ERRINFO 而不是 pduType 不符。
+
+VM 真实客户端：Ubuntu 22.04 `apt install freerdp2-x11`（xfreerdp 2.6.1）+ `Xvfb :99 -screen 0 1024x768x24`，`rdpserve -listen 127.0.0.1:33891 -user demo -password-env RDP_DEMO_PASSWORD -json`（临时自签名证书）。
+
+| 用例 | 结果 |
+|---|---|
+| `xfreerdp /v:127.0.0.1:33891 /u:demo /p:… /cert:ignore /size:640x480 /sec:tls /bpp:32` | 服务端日志 `x224 ok → tls ok → mcs-connect ok → mcs-join ok → client-info ok → license ok → capabilities ok → finalize ok → output ok`；xfreerdp 窗口 640x480，`import -window root` 截图采样 (5,5)=白、(100,50)=黄、(200,50)=青、(320,400)=灰 (200,200,200)、(636,476)=(32,32,96) 与 `TestPattern` 一致（服务端按客户端首选 32bpp 转换推送）；无 xfreerdp 错误；Ctrl-C 后服务端 `{"authorized":true,"client":"devin-box","stage":"output","user":"demo",...}` |
+| 同上 `/size:400x300 /bpp:16`，不带 `/sec:`（客户端默认请求 NLA\|TLS） | 服务端选 PROTOCOL_SSL，xfreerdp 接受；16bpp 推送截图采样白/黄/青/绿/(32,32,96)/黑与图案一致 |
+| `/p:wrong`（策略拒绝） | 服务端 `policy denied user "demo" … : bad password`，`stage":"mcs-join","authorized":false`；xfreerdp 日志 `ERRINFO_SERVER_DENIED_CONNECTION (0x00000007):The server denied the connection.`，退出 |
+| `/sec:rdp`（仅 Standard RDP Security） | 服务端 `negotiation failed: client offered protocols 0x00000000 without PROTOCOL_SSL`；xfreerdp `Error: SSL_REQUIRED_BY_SERVER` / `Protocol Security Negotiation Failure` |
+
+说明：xfreerdp 2.6.1 在 CS_NET 请求 cliprdr/rdpdr/rdpsnd/drdynvc 等静态通道，服务端按请求顺序分配 1004 起的通道号并接受加入，通道数据被丢弃；客户端激活后发送的 fast-path 输入（鼠标移动）被按长度丢弃，未解析。截图中光标由 Xvfb/xfreerdp 合成，截图工具不含光标，彩色指针只能确认 xfreerdp 无错误接收（Go 客户端回环中已逐字段往返）。mstsc / Windows 客户端未测。
+
 ## 6. 本轮验证不覆盖
 
 - 用户认证结果的协议层判定：无 NLA/CredSSP；xrdp 侧日志确认 INFO_AUTOLOGON 凭据登录成功并启动了 Xorg 会话，但观察窗口内没有收到任何 Save Session Info，探测器不能自行判定登录结果；Save Session Info / Set Error Info 解码只经单元测试验证。错误密码用例未跑（xrdp 失败时同样只在服务端日志体现）。
@@ -189,4 +205,5 @@ xrdp 侧日志（带凭据）：`xrdp.log` 记录 `sending login info to session
 - 图形：只解码 Slow-Path Bitmap Update（xrdp 上只出现 24bpp RLE，8/15/16/32bpp、未压缩位图和 Palette 只经单测；解码正确性靠肉眼比对 PNG，没有逐像素参考）；orders 不解析，Surface Commands 只计数；fast-path 分片重组、压缩标志拒绝、Large Pointer、Pointer Position 合成只经单测（xrdp 更新都很小、不发位置）；输入；其余 Share Data PDU 只按 pduType2 计数。
 - 静态虚拟通道（客户端请求 0 个）、消息通道、多传输通道；服务端若分配未请求的通道会被拒绝。
 - 真实 Windows 目标、公网目标、Standard RDP Security 服务器（探测器按设计拒绝）。
+- 服务端角色：只对 xfreerdp 2.6.1 验证，mstsc/Windows 客户端、NLA 客户端（被按设计降到 TLS 或拒绝）、多显示器、Auto-Reconnect、重激活（Deactivate All → 新 Demand Active）、Shutdown Request 真实路径、空闲超时、并发上限（只有单元/手工路径）未在真实客户端上验证；位图只发未压缩矩形，没有压缩编码、fast-path 输出、orders；输入被丢弃；不连接上游目标。
 - 证书验证关闭或降级路径：不存在该选项，也不计划提供。

@@ -252,3 +252,126 @@ func fixedUTF16(s string, chars int) ([]byte, error) {
 	}
 	return append(b, make([]byte, 2*chars-len(b))...), nil
 }
+
+// DecodeClientInfoPDU strips the Basic Security Header (SEC_INFO_PKT must be
+// set) and decodes the TS_INFO_PACKET.
+func DecodeClientInfoPDU(p []byte) (ClientInfo, error) {
+	hdr, body, err := DecodeBasicSecurityHeader(p)
+	if err != nil {
+		return ClientInfo{}, err
+	}
+	if hdr.Flags&SecInfoPkt == 0 {
+		return ClientInfo{}, fmt.Errorf("%w: security flags 0x%04x lack SEC_INFO_PKT", ErrClientInfo, hdr.Flags)
+	}
+	return DecodeClientInfo(body)
+}
+
+// DecodeClientInfo parses a TS_INFO_PACKET (without security header). Both
+// the Unicode and the ANSI (code page 1252 subset) forms are accepted; the
+// extended info packet is optional.
+func DecodeClientInfo(p []byte) (ClientInfo, error) {
+	var ci ClientInfo
+	if len(p) < 18 {
+		return ci, fmt.Errorf("%w: info packet %d bytes", ErrClientInfo, len(p))
+	}
+	ci.CodePage = binary.LittleEndian.Uint32(p)
+	ci.Flags = binary.LittleEndian.Uint32(p[4:])
+	unicode := ci.Flags&InfoUnicode != 0
+	lengths := make([]int, 5)
+	for i := range lengths {
+		lengths[i] = int(binary.LittleEndian.Uint16(p[8+2*i:]))
+	}
+	rest := p[18:]
+	term := 1
+	if unicode {
+		term = 2
+	}
+	fields := []*string{&ci.Domain, &ci.UserName, &ci.Password, &ci.AlternateShell, &ci.WorkingDir}
+	maxes := []int{maxInfoDomainBytes, maxInfoUserNameBytes, maxInfoPasswordBytes, maxInfoAltShellBytes, maxInfoWorkingDirBytes}
+	for i, n := range lengths {
+		if n > maxes[i] || (unicode && n%2 != 0) {
+			return ci, fmt.Errorf("%w: field %d length %d", ErrClientInfo, i, n)
+		}
+		if len(rest) < n+term {
+			return ci, fmt.Errorf("%w: field %d truncated", ErrClientInfo, i)
+		}
+		s, err := infoString(rest[:n], unicode)
+		if err != nil {
+			return ci, fmt.Errorf("%w: field %d: %v", ErrClientInfo, i, err)
+		}
+		*fields[i] = s
+		rest = rest[n+term:]
+	}
+	if len(rest) == 0 {
+		return ci, nil
+	}
+	// TS_EXTENDED_INFO_PACKET (optional; RDP 5.0+).
+	if len(rest) < 4 {
+		return ci, fmt.Errorf("%w: extended info truncated", ErrClientInfo)
+	}
+	ci.ClientAddressFamily = binary.LittleEndian.Uint16(rest)
+	n := int(binary.LittleEndian.Uint16(rest[2:]))
+	rest = rest[4:]
+	if n > maxInfoClientAddrBytes+2 || len(rest) < n {
+		return ci, fmt.Errorf("%w: cbClientAddress %d", ErrClientInfo, n)
+	}
+	ci.ClientAddress = utf16zString(rest[:n], n)
+	rest = rest[n:]
+	if len(rest) < 2 {
+		return ci, nil
+	}
+	n = int(binary.LittleEndian.Uint16(rest))
+	rest = rest[2:]
+	if n > maxInfoClientDirBytes+2 || len(rest) < n {
+		return ci, fmt.Errorf("%w: cbClientDir %d", ErrClientInfo, n)
+	}
+	ci.ClientDir = utf16zString(rest[:n], n)
+	rest = rest[n:]
+	if len(rest) < timeZoneInfoLen {
+		return ci, nil
+	}
+	ci.TimeZone = decodeTimeZone(rest[:timeZoneInfoLen])
+	rest = rest[timeZoneInfoLen:]
+	if len(rest) >= 4 {
+		ci.SessionID = binary.LittleEndian.Uint32(rest)
+		rest = rest[4:]
+	}
+	if len(rest) >= 4 {
+		ci.PerformanceFlags = binary.LittleEndian.Uint32(rest)
+	}
+	// cbAutoReconnectCookie, the cookie, reserved1/2 and later fields are
+	// not needed by the server role and are ignored.
+	return ci, nil
+}
+
+func infoString(b []byte, unicode bool) (string, error) {
+	if unicode {
+		return utf16zString(b, len(b)), nil
+	}
+	for _, c := range b {
+		if c >= 0x80 || c == 0 {
+			return "", errors.New("non-ASCII byte in ANSI info string")
+		}
+	}
+	return string(b), nil
+}
+
+func decodeSystemTime(b []byte) SystemTime {
+	var t SystemTime
+	for i, f := range []*uint16{&t.Year, &t.Month, &t.DayOfWeek, &t.Day, &t.Hour, &t.Minute, &t.Second, &t.Milliseconds} {
+		*f = binary.LittleEndian.Uint16(b[2*i:])
+	}
+	return t
+}
+
+func decodeTimeZone(b []byte) TimeZoneInformation {
+	return TimeZoneInformation{
+		Bias:         int32(binary.LittleEndian.Uint32(b)),
+		StandardName: utf16zString(b[4:68], 64),
+		StandardDate: decodeSystemTime(b[68:84]),
+		StandardBias: int32(binary.LittleEndian.Uint32(b[84:])),
+		DaylightName: utf16zString(b[88:152], 64),
+		DaylightDate: decodeSystemTime(b[152:168]),
+		DaylightBias: int32(binary.LittleEndian.Uint32(b[168:])),
+	}
+}

@@ -524,3 +524,122 @@ func DecodeDataPDU(p []byte) (DataPDU, error) {
 	}
 	return d, nil
 }
+
+// --- Server side -----------------------------------------------------------
+
+// EncodeDemandActive builds a Demand Active PDU (TS_DEMAND_ACTIVE_PDU) sent
+// from the server channel.
+func EncodeDemandActive(shareID uint32, sourceDescriptor string, sets []CapabilitySet) ([]byte, error) {
+	caps, err := encodeCapabilitySets(sets)
+	if err != nil {
+		return nil, err
+	}
+	src := append([]byte(sourceDescriptor), 0)
+	if len(src) > 0xffff {
+		return nil, fmt.Errorf("%w: source descriptor too long", ErrShare)
+	}
+	combined := 4 + len(caps)
+	if combined > 0xffff {
+		return nil, fmt.Errorf("%w: capability sets too large", ErrShare)
+	}
+	body := make([]byte, 0, 12+len(src)+combined)
+	body = binary.LittleEndian.AppendUint32(body, shareID)
+	body = binary.LittleEndian.AppendUint16(body, uint16(len(src)))
+	body = binary.LittleEndian.AppendUint16(body, uint16(combined))
+	body = append(body, src...)
+	body = binary.LittleEndian.AppendUint16(body, uint16(len(sets)))
+	body = binary.LittleEndian.AppendUint16(body, 0)
+	body = append(body, caps...)
+	body = binary.LittleEndian.AppendUint32(body, 0) // sessionId
+	return EncodeShareControl(PDUTypeDemandActive, ServerChannelID, body)
+}
+
+// EncodeDeactivateAll builds a Deactivate All PDU (2.2.3.1).
+func EncodeDeactivateAll(shareID uint32, sourceDescriptor string) ([]byte, error) {
+	src := append([]byte(sourceDescriptor), 0)
+	body := binary.LittleEndian.AppendUint32(nil, shareID)
+	body = binary.LittleEndian.AppendUint16(body, uint16(len(src)))
+	body = append(body, src...)
+	return EncodeShareControl(PDUTypeDeactivateAll, ServerChannelID, body)
+}
+
+// EncodeFontMap builds the server Font Map PDU (2.2.1.22) with no entries.
+func EncodeFontMap(shareID uint32) ([]byte, error) {
+	body := make([]byte, 8)
+	binary.LittleEndian.PutUint16(body[4:], fontMapFlags)
+	binary.LittleEndian.PutUint16(body[6:], fontMapEntrySiz)
+	return EncodeShareData(shareID, ServerChannelID, PDUType2FontMap, body)
+}
+
+// EncodeErrorInfo builds a Set Error Info PDU (2.2.5.1.1).
+func EncodeErrorInfo(shareID uint32, code uint32) ([]byte, error) {
+	return EncodeShareData(shareID, ServerChannelID, PDUType2SetErrorInfo, binary.LittleEndian.AppendUint32(nil, code))
+}
+
+// ERRINFO codes (2.2.5.1.1) used by the server role.
+const (
+	ErrInfoRPCInitiatedDisconnect  uint32 = 0x00000001
+	ErrInfoRPCInitiatedLogoff      uint32 = 0x00000002
+	ErrInfoLogoffByUser            uint32 = 0x0000000C
+	ErrInfoServerDeniedConnection  uint32 = 0x00000007
+	ErrInfoServerInsufficientPrivs uint32 = 0x00000009
+	ErrInfoCapsSizeMismatch        uint32 = 0x000010CB
+	ErrInfoBadCapabilities         uint32 = 0x000010C9
+	ErrInfoServerSecurityData      uint32 = 0x000010D3
+	ErrInfoServerConfirmActive     uint32 = 0x000010DA
+	ErrInfoVirtualChannelDecoding  uint32 = 0x000010E6
+	ErrInfoInvalidSecurityData     uint32 = 0x000010E2
+	ErrInfoSecurityDataTooShort    uint32 = 0x000010E8
+	ErrInfoUnknownPDUType          uint32 = 0x000010CF
+)
+
+// FontList is TS_FONT_LIST_PDU payload.
+type FontList struct {
+	NumberFonts   uint16
+	TotalNumFonts uint16
+	ListFlags     uint16
+	EntrySize     uint16
+}
+
+func decodeFontList(body []byte) (FontList, error) {
+	if len(body) < 8 {
+		return FontList{}, fmt.Errorf("%w: font list body %d bytes", ErrShare, len(body))
+	}
+	return FontList{
+		NumberFonts:   binary.LittleEndian.Uint16(body),
+		TotalNumFonts: binary.LittleEndian.Uint16(body[2:]),
+		ListFlags:     binary.LittleEndian.Uint16(body[4:]),
+		EntrySize:     binary.LittleEndian.Uint16(body[6:]),
+	}, nil
+}
+
+// DecodeClientDataPDU parses a client Share Data PDU; Synchronize and
+// Control use the shared decoders, Font List is typed here.
+func DecodeClientDataPDU(p []byte) (DataPDU, FontList, bool, error) {
+	d, err := DecodeDataPDU(p)
+	if err != nil {
+		return d, FontList{}, false, err
+	}
+	if d.Header.PDUType2 == PDUType2FontList {
+		fl, err := decodeFontList(d.Body)
+		return d, fl, err == nil, err
+	}
+	return d, FontList{}, false, nil
+}
+
+// EncodeServerSynchronize builds the server Synchronize PDU targeting the
+// client's user channel.
+func EncodeServerSynchronize(shareID uint32, targetUser uint16) ([]byte, error) {
+	body := binary.LittleEndian.AppendUint16(nil, SyncMsgTypeSync)
+	body = binary.LittleEndian.AppendUint16(body, targetUser)
+	return EncodeShareData(shareID, ServerChannelID, PDUType2Synchronize, body)
+}
+
+// EncodeServerControl builds a server Control PDU (Cooperate or Granted
+// Control).
+func EncodeServerControl(shareID uint32, action, grantID uint16, controlID uint32) ([]byte, error) {
+	body := binary.LittleEndian.AppendUint16(nil, action)
+	body = binary.LittleEndian.AppendUint16(body, grantID)
+	body = binary.LittleEndian.AppendUint32(body, controlID)
+	return EncodeShareData(shareID, ServerChannelID, PDUType2Control, body)
+}

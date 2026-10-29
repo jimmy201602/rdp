@@ -265,3 +265,177 @@ func DecodeChannelJoinConfirm(p []byte) (ChannelJoinConfirm, error) {
 	}
 	return c, nil
 }
+
+// --- Server side -----------------------------------------------------------
+
+// ConnectInitial is the decoded client MCS Connect-Initial.
+type ConnectInitial struct {
+	Target, Minimum, Maximum DomainParameters
+	UserData                 []byte // GCC ConferenceCreateRequest
+}
+
+// DecodeConnectInitial parses a BER MCS Connect-Initial PDU.
+func DecodeConnectInitial(p []byte) (ConnectInitial, error) {
+	var ci ConnectInitial
+	body, rest, err := berRead(p, []byte{0x7f, mcsTagConnectInitial})
+	if err != nil {
+		return ci, fmt.Errorf("%w: connect initial: %v", ErrMCS, err)
+	}
+	if len(rest) != 0 {
+		return ci, fmt.Errorf("%w: %d trailing bytes after Connect-Initial", ErrMCS, len(rest))
+	}
+	if _, body, err = berRead(body, []byte{berOctetString}); err != nil { // callingDomainSelector
+		return ci, fmt.Errorf("%w: callingDomainSelector: %v", ErrMCS, err)
+	}
+	if _, body, err = berRead(body, []byte{berOctetString}); err != nil { // calledDomainSelector
+		return ci, fmt.Errorf("%w: calledDomainSelector: %v", ErrMCS, err)
+	}
+	if _, body, err = berRead(body, []byte{berBoolean}); err != nil { // upwardFlag
+		return ci, fmt.Errorf("%w: upwardFlag: %v", ErrMCS, err)
+	}
+	for i, dst := range []*DomainParameters{&ci.Target, &ci.Minimum, &ci.Maximum} {
+		params, next, err := berRead(body, []byte{berSequence})
+		if err != nil {
+			return ci, fmt.Errorf("%w: domainParameters %d: %v", ErrMCS, i, err)
+		}
+		if *dst, err = decodeDomainParameters(params); err != nil {
+			return ci, fmt.Errorf("%w: domainParameters %d: %v", ErrMCS, i, err)
+		}
+		body = next
+	}
+	userData, body, err := berRead(body, []byte{berOctetString})
+	if err != nil {
+		return ci, fmt.Errorf("%w: userData: %v", ErrMCS, err)
+	}
+	if len(body) != 0 {
+		return ci, fmt.Errorf("%w: %d trailing bytes in Connect-Initial", ErrMCS, len(body))
+	}
+	ci.UserData = userData
+	return ci, nil
+}
+
+// ServerDomainParameters are the parameters a server answers with (the
+// MS-RDPBCGR 4.1.4 Connect-Response values: 34 channels, 3 users, 1 priority,
+// 65528-byte PDUs).
+var ServerDomainParameters = DomainParameters{34, 3, 0, 1, 0, 1, 65528, 2}
+
+// EncodeConnectResponse builds the BER MCS Connect-Response with
+// rt-successful, calledConnectId 0 and the given GCC user data.
+func EncodeConnectResponse(params DomainParameters, userData []byte) []byte {
+	var body []byte
+	for _, v := range []uint32{params.MaxChannelIDs, params.MaxUserIDs, params.MaxTokenIDs, params.NumPriorities, params.MinThroughput, params.MaxHeight, params.MaxMCSPDUSize, params.ProtocolVersion} {
+		body = append(body, berIntCanonical(v)...)
+	}
+	body = berElement([]byte{berSequence}, body)
+	body = append([]byte{berEnumerated, 1, 0, berInteger, 1, 0}, body...)
+	body = append(body, berElement([]byte{berOctetString}, userData)...)
+	return berElement([]byte{0x7f, mcsTagConnectResponse}, body)
+}
+
+// DecodeErectDomainRequest accepts a PER ErectDomainRequest of any
+// subHeight / subInterval (the values are irrelevant to RDP).
+func DecodeErectDomainRequest(p []byte) error {
+	if err := domainPDUChoice(p, mcsErectDomainRequest, "ErectDomainRequest"); err != nil {
+		return err
+	}
+	if len(p) < 3 {
+		return fmt.Errorf("%w: ErectDomainRequest too short", ErrMCS)
+	}
+	return nil
+}
+
+// DecodeAttachUserRequest accepts a PER AttachUserRequest.
+func DecodeAttachUserRequest(p []byte) error {
+	if err := domainPDUChoice(p, mcsAttachUserRequest, "AttachUserRequest"); err != nil {
+		return err
+	}
+	if len(p) != 1 {
+		return fmt.Errorf("%w: AttachUserRequest has %d bytes, want 1", ErrMCS, len(p))
+	}
+	return nil
+}
+
+// EncodeAttachUserConfirm builds an rt-successful AttachUserConfirm for the
+// given user channel (initiator = userChannel - 1001).
+func EncodeAttachUserConfirm(userChannel uint16) ([]byte, error) {
+	if userChannel < mcsUserIDBase {
+		return nil, fmt.Errorf("%w: user channel %d below %d", ErrMCS, userChannel, mcsUserIDBase)
+	}
+	out := []byte{mcsAttachUserConfirm<<2 | 0x02, 0x00, 0, 0}
+	binary.BigEndian.PutUint16(out[2:], userChannel-mcsUserIDBase)
+	return out, nil
+}
+
+// EncodeAttachUserFailure builds an AttachUserConfirm with the given
+// non-zero result and no initiator.
+func EncodeAttachUserFailure(result uint8) []byte {
+	return []byte{mcsAttachUserConfirm<<2 | result>>3&0x01, result << 5}
+}
+
+// ChannelJoinRequest is a decoded PER ChannelJoinRequest.
+type ChannelJoinRequest struct {
+	UserChannel uint16 // initiator + 1001
+	ChannelID   uint16
+}
+
+func DecodeChannelJoinRequest(p []byte) (ChannelJoinRequest, error) {
+	var r ChannelJoinRequest
+	if err := domainPDUChoice(p, mcsChannelJoinRequest, "ChannelJoinRequest"); err != nil {
+		return r, err
+	}
+	if len(p) != 5 {
+		return r, fmt.Errorf("%w: ChannelJoinRequest has %d bytes, want 5", ErrMCS, len(p))
+	}
+	user, err := userID(binary.BigEndian.Uint16(p[1:]))
+	if err != nil {
+		return r, err
+	}
+	r.UserChannel = user
+	r.ChannelID = binary.BigEndian.Uint16(p[3:])
+	return r, nil
+}
+
+// EncodeChannelJoinConfirm builds an rt-successful ChannelJoinConfirm for the
+// requested channel (requested == channelId).
+func EncodeChannelJoinConfirm(userChannel, channelID uint16) ([]byte, error) {
+	if userChannel < mcsUserIDBase {
+		return nil, fmt.Errorf("%w: user channel %d below %d", ErrMCS, userChannel, mcsUserIDBase)
+	}
+	out := []byte{mcsChannelJoinConfirm<<2 | 0x02, 0x00, 0, 0, 0, 0, 0, 0}
+	binary.BigEndian.PutUint16(out[2:], userChannel-mcsUserIDBase)
+	binary.BigEndian.PutUint16(out[4:], channelID)
+	binary.BigEndian.PutUint16(out[6:], channelID)
+	return out, nil
+}
+
+// EncodeChannelJoinFailure builds a ChannelJoinConfirm with a non-zero
+// result and no channelId.
+func EncodeChannelJoinFailure(result uint8, userChannel, requested uint16) ([]byte, error) {
+	if userChannel < mcsUserIDBase {
+		return nil, fmt.Errorf("%w: user channel %d below %d", ErrMCS, userChannel, mcsUserIDBase)
+	}
+	out := []byte{mcsChannelJoinConfirm<<2 | result>>3&0x01, result << 5, 0, 0, 0, 0}
+	binary.BigEndian.PutUint16(out[2:], userChannel-mcsUserIDBase)
+	binary.BigEndian.PutUint16(out[4:], requested)
+	return out, nil
+}
+
+// DisconnectProviderUltimatum reasons (T.125 Reason).
+const (
+	DisconnectReasonUserRequested uint8 = 3
+	DisconnectReasonProviderInit  uint8 = 1
+)
+
+// EncodeDisconnectProviderUltimatum builds the PER DisconnectProviderUltimatum.
+func EncodeDisconnectProviderUltimatum(reason uint8) []byte {
+	return []byte{mcsDisconnectProviderUltimatum<<2 | reason>>1&0x03, reason << 7}
+}
+
+// IsDisconnectProviderUltimatum reports whether p is a DisconnectProviderUltimatum
+// and returns its reason.
+func IsDisconnectProviderUltimatum(p []byte) (uint8, bool) {
+	if len(p) < 2 || int(p[0]>>2) != mcsDisconnectProviderUltimatum {
+		return 0, false
+	}
+	return p[0]&0x03<<1 | p[1]>>7, true
+}

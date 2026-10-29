@@ -724,3 +724,20 @@ func ansiZ(s, name string) ([]byte, error) {
 	}
 	return append([]byte(s), 0), nil
 }
+
+// --- Server side -----------------------------------------------------------
+
+// EncodeValidClientAlert returns the licensing PDU (preamble + error
+// message, no security header) a server sends to skip licensing:
+// STATUS_VALID_CLIENT with ST_NO_TRANSITION and an empty BB_ERROR_BLOB
+// (MS-RDPBCGR 2.2.1.12.1.3).
+func EncodeValidClientAlert() []byte {
+	body := binary.LittleEndian.AppendUint32(nil, StatusValidClient)
+	body = binary.LittleEndian.AppendUint32(body, StateNoTransition)
+	body = appendBlob(body, BlobError, nil)
+	out := make([]byte, preambleLen, preambleLen+len(body))
+	out[0] = MsgErrorAlert
+	out[1] = preambleVersion3
+	binary.LittleEndian.PutUint16(out[2:], uint16(preambleLen+len(body)))
+	return append(out, body...)
+}

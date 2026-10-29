@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -180,4 +181,76 @@ func DecodeConnectionConfirm(p []byte) (ConnectionConfirm, error) {
 	default:
 		return cc, fmt.Errorf("%w: unexpected negotiation type 0x%02x", ErrX224, rest[0])
 	}
+}
+
+// --- Server side -----------------------------------------------------------
+
+// DecodeConnectionRequest parses a Client X.224 Connection Request TPKT
+// payload. A request without RDP_NEG_REQ (HasNegotiation false) asks for
+// Standard RDP Security only, which a TLS-only server must refuse.
+func DecodeConnectionRequest(p []byte) (ConnectionRequest, bool, error) {
+	var cr ConnectionRequest
+	if len(p) < x224FixedPartSize {
+		return cr, false, fmt.Errorf("%w: connection request shorter than fixed part (%d bytes)", ErrX224, len(p))
+	}
+	if li := int(p[0]); li != len(p)-1 {
+		return cr, false, fmt.Errorf("%w: length indicator %d does not match payload %d", ErrX224, li, len(p))
+	}
+	if p[1]&0xF0 != X224ConnectionRequest {
+		return cr, false, fmt.Errorf("%w: expected connection request, got TPDU code 0x%02x", ErrX224, p[1])
+	}
+	if p[6]&0x03 != 0 {
+		return cr, false, fmt.Errorf("%w: unsupported X.224 class option 0x%02x", ErrX224, p[6])
+	}
+	rest := p[x224FixedPartSize:]
+	// Optional routingToken / cookie: printable ASCII terminated by CR LF.
+	if i := bytes.Index(rest, []byte("\r\n")); i >= 0 {
+		for _, b := range rest[:i] {
+			if b < 0x20 || b > 0x7e {
+				return cr, false, fmt.Errorf("%w: cookie contains non-printable byte 0x%02x", ErrX224, b)
+			}
+		}
+		cr.Cookie = string(rest[:i])
+		rest = rest[i+2:]
+	}
+	if len(rest) == 0 {
+		return cr, false, nil
+	}
+	if len(rest) != negotiationStructureSize {
+		return cr, false, fmt.Errorf("%w: negotiation structure has %d bytes, want %d", ErrX224, len(rest), negotiationStructureSize)
+	}
+	if rest[0] != TypeNegotiationRequest {
+		return cr, false, fmt.Errorf("%w: unexpected negotiation type 0x%02x", ErrX224, rest[0])
+	}
+	if size := binary.LittleEndian.Uint16(rest[2:]); size != negotiationStructureSize {
+		return cr, false, fmt.Errorf("%w: negotiation length field %d", ErrX224, size)
+	}
+	cr.Flags = rest[1]
+	cr.RequestedProtocols = binary.LittleEndian.Uint32(rest[4:])
+	return cr, true, nil
+}
+
+// EncodeConnectionConfirm builds a Server X.224 Connection Confirm with an
+// RDP_NEG_RSP selecting the given protocol (MS-RDPBCGR 2.2.1.2 / 4.1.2 shape:
+// LI covers rdpNegData).
+func EncodeConnectionConfirm(flags uint8, selected uint32) []byte {
+	return connectionConfirm(TypeNegotiationResponse, flags, selected)
+}
+
+// EncodeNegotiationFailure builds a Server X.224 Connection Confirm carrying
+// an RDP_NEG_FAILURE with the given failureCode.
+func EncodeNegotiationFailure(code uint32) []byte {
+	return connectionConfirm(TypeNegotiationFailure, 0, code)
+}
+
+func connectionConfirm(typ, flags uint8, value uint32) []byte {
+	out := make([]byte, x224FixedPartSize+negotiationStructureSize)
+	out[0] = byte(len(out) - 1)
+	out[1] = X224ConnectionConfirm
+	n := x224FixedPartSize
+	out[n] = typ
+	out[n+1] = flags
+	binary.LittleEndian.PutUint16(out[n+2:], negotiationStructureSize)
+	binary.LittleEndian.PutUint32(out[n+4:], value)
+	return out
 }

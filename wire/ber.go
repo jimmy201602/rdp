@@ -100,3 +100,16 @@ func berReadUint(p []byte, tag byte) (uint32, []byte, error) {
 	}
 	return v, rest, nil
 }
+
+// berIntCanonical encodes v as a canonical X.690 INTEGER (a leading zero
+// octet when the top bit is set), the form Windows servers use in the MCS
+// Connect-Response (MS-RDPBCGR 4.1.4 encodes 65528 as 02 03 00 ff f8).
+func berIntCanonical(v uint32) []byte {
+	var b []byte
+	for v > 0x7f {
+		b = append([]byte{byte(v)}, b...)
+		v >>= 8
+	}
+	b = append([]byte{byte(v)}, b...)
+	return berElement([]byte{berInteger}, b)
+}

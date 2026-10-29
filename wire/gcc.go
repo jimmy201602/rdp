@@ -363,3 +363,184 @@ func DecodeServerNetworkData(p []byte) (ServerNetworkData, error) {
 	}
 	return s, nil
 }
+
+// --- Server side -----------------------------------------------------------
+
+// ParseConferenceCreateRequest extracts the client user data blocks from the
+// GCC ConnectData / ConferenceCreateRequest in an MCS Connect-Initial.
+func ParseConferenceCreateRequest(p []byte) ([]byte, error) {
+	if len(p) < len(t124ObjectKey) || !bytes.Equal(p[:len(t124ObjectKey)], t124ObjectKey) {
+		return nil, fmt.Errorf("%w: missing T.124 object identifier", ErrGCC)
+	}
+	p = p[len(t124ObjectKey):]
+	n, p, err := perReadLength(p)
+	if err != nil {
+		return nil, fmt.Errorf("%w: connectPDU length: %v", ErrGCC, err)
+	}
+	if n != len(p) {
+		return nil, fmt.Errorf("%w: connectPDU declares %d bytes, %d present", ErrGCC, n, len(p))
+	}
+	if len(p) < len(ccRequestPrefix) || !bytes.Equal(p[:len(ccRequestPrefix)], ccRequestPrefix) {
+		return nil, fmt.Errorf("%w: not a ConferenceCreateRequest with %q user data", ErrGCC, "Duca")
+	}
+	p = p[len(ccRequestPrefix):]
+	n, p, err = perReadLength(p)
+	if err != nil {
+		return nil, fmt.Errorf("%w: user data length: %v", ErrGCC, err)
+	}
+	if n != len(p) {
+		return nil, fmt.Errorf("%w: user data declares %d bytes, %d present", ErrGCC, n, len(p))
+	}
+	return p, nil
+}
+
+// ccResponsePrefix is the PER ConferenceCreateResponse up to the "McDn"
+// h221NonStandard key (MS-RDPBCGR 4.1.4): nodeID 0x79f3, tag 1, result
+// success, one user data set.
+var ccResponsePrefix = []byte{0x14, 0x76, 0x0a, 0x01, 0x01, 0x00, 0x01, 0xc0, 0x00, 'M', 'c', 'D', 'n'}
+
+// EncodeConferenceCreateResponse wraps concatenated server user data blocks
+// in the PER GCC ConnectData / ConferenceCreateResponse structure.
+func EncodeConferenceCreateResponse(blocks []byte) ([]byte, error) {
+	inner, err := perLength(len(blocks))
+	if err != nil {
+		return nil, err
+	}
+	pdu := make([]byte, 0, len(ccResponsePrefix)+len(inner)+len(blocks))
+	pdu = append(pdu, ccResponsePrefix...)
+	pdu = append(pdu, inner...)
+	pdu = append(pdu, blocks...)
+	outer, err := perLength(len(pdu))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, len(t124ObjectKey)+len(outer)+len(pdu))
+	out = append(out, t124ObjectKey...)
+	out = append(out, outer...)
+	return append(out, pdu...), nil
+}
+
+func getUTF16Fixed(p []byte) string { return utf16zString(p, len(p)) }
+
+// DecodeClientCoreData parses TS_UD_CS_CORE. Fields after the 132-byte
+// RDP 4.0 core are optional and left zero when absent.
+func DecodeClientCoreData(p []byte) (ClientCoreData, error) {
+	var c ClientCoreData
+	if len(p) < 128 {
+		return c, fmt.Errorf("%w: CS_CORE has %d bytes", ErrGCC, len(p))
+	}
+	c.Version = binary.LittleEndian.Uint32(p)
+	c.DesktopWidth = binary.LittleEndian.Uint16(p[4:])
+	c.DesktopHeight = binary.LittleEndian.Uint16(p[6:])
+	c.ColorDepth = binary.LittleEndian.Uint16(p[8:])
+	c.SASSequence = binary.LittleEndian.Uint16(p[10:])
+	c.KeyboardLayout = binary.LittleEndian.Uint32(p[12:])
+	c.ClientBuild = binary.LittleEndian.Uint32(p[16:])
+	c.ClientName = getUTF16Fixed(p[20:52])
+	c.KeyboardType = binary.LittleEndian.Uint32(p[52:])
+	c.KeyboardSubType = binary.LittleEndian.Uint32(p[56:])
+	c.KeyboardFunctionKey = binary.LittleEndian.Uint32(p[60:])
+	c.ImeFileName = getUTF16Fixed(p[64:128])
+	if len(p) >= 130 {
+		c.PostBeta2ColorDepth = binary.LittleEndian.Uint16(p[128:])
+	}
+	if len(p) >= 132 {
+		c.ClientProductID = binary.LittleEndian.Uint16(p[130:])
+	}
+	if len(p) >= 136 {
+		c.SerialNumber = binary.LittleEndian.Uint32(p[132:])
+	}
+	if len(p) >= 138 {
+		c.HighColorDepth = binary.LittleEndian.Uint16(p[136:])
+	}
+	if len(p) >= 140 {
+		c.SupportedColorDepths = binary.LittleEndian.Uint16(p[138:])
+	}
+	if len(p) >= 142 {
+		c.EarlyCapabilityFlags = binary.LittleEndian.Uint16(p[140:])
+	}
+	if len(p) >= 206 {
+		c.ClientDigProductID = getUTF16Fixed(p[142:206])
+	}
+	if len(p) >= 207 {
+		c.ConnectionType = p[206]
+	}
+	if len(p) >= 212 {
+		c.ServerSelectedProtocol = binary.LittleEndian.Uint32(p[208:])
+	}
+	return c, nil
+}
+
+// DecodeClientSecurityData parses TS_UD_CS_SEC.
+func DecodeClientSecurityData(p []byte) (ClientSecurityData, error) {
+	if len(p) < 8 {
+		return ClientSecurityData{}, fmt.Errorf("%w: CS_SECURITY has %d bytes", ErrGCC, len(p))
+	}
+	return ClientSecurityData{
+		EncryptionMethods:    binary.LittleEndian.Uint32(p),
+		ExtEncryptionMethods: binary.LittleEndian.Uint32(p[4:]),
+	}, nil
+}
+
+// DecodeClientNetworkData parses TS_UD_CS_NET.
+func DecodeClientNetworkData(p []byte) (ClientNetworkData, error) {
+	var n ClientNetworkData
+	if len(p) < 4 {
+		return n, fmt.Errorf("%w: CS_NET has %d bytes", ErrGCC, len(p))
+	}
+	count := int(binary.LittleEndian.Uint32(p))
+	if count > 31 || len(p) != 4+12*count {
+		return n, fmt.Errorf("%w: CS_NET has %d bytes for %d channels", ErrGCC, len(p), count)
+	}
+	for i := 0; i < count; i++ {
+		off := 4 + 12*i
+		name := p[off : off+8]
+		if j := bytes.IndexByte(name, 0); j >= 0 {
+			name = name[:j]
+		}
+		for _, b := range name {
+			if b < 0x21 || b > 0x7e {
+				return n, fmt.Errorf("%w: channel %d name contains invalid byte 0x%02x", ErrGCC, i, b)
+			}
+		}
+		n.Channels = append(n.Channels, ChannelDef{Name: string(name), Options: binary.LittleEndian.Uint32(p[off+8:])})
+	}
+	return n, nil
+}
+
+// Encode produces TS_UD_SC_CORE with the optional fields that are set.
+func (s ServerCoreData) Encode() ([]byte, error) {
+	p := binary.LittleEndian.AppendUint32(nil, s.Version)
+	if s.HasRequestedProtocols || s.HasEarlyCapabilityFlags {
+		p = binary.LittleEndian.AppendUint32(p, s.ClientRequestedProtocols)
+	}
+	if s.HasEarlyCapabilityFlags {
+		p = binary.LittleEndian.AppendUint32(p, s.EarlyCapabilityFlags)
+	}
+	return UserDataBlock{Type: SCCore, Payload: p}.Encode()
+}
+
+// Encode produces TS_UD_SC_SEC1. Only ENCRYPTION_METHOD_NONE /
+// ENCRYPTION_LEVEL_NONE is supported (Enhanced RDP Security).
+func (s ServerSecurityData) Encode() ([]byte, error) {
+	if s.EncryptionMethod != 0 || s.EncryptionLevel != 0 || len(s.ServerRandom) != 0 || len(s.ServerCertificate) != 0 {
+		return nil, fmt.Errorf("%w: only ENCRYPTION_METHOD_NONE can be encoded", ErrGCC)
+	}
+	return UserDataBlock{Type: SCSecurity, Payload: make([]byte, 8)}.Encode()
+}
+
+// Encode produces TS_UD_SC_NET (padded to a multiple of 4 bytes).
+func (s ServerNetworkData) Encode() ([]byte, error) {
+	if len(s.ChannelIDs) > 31 {
+		return nil, fmt.Errorf("%w: %d static channels exceeds 31", ErrGCC, len(s.ChannelIDs))
+	}
+	p := binary.LittleEndian.AppendUint16(nil, s.IOChannel)
+	p = binary.LittleEndian.AppendUint16(p, uint16(len(s.ChannelIDs)))
+	for _, id := range s.ChannelIDs {
+		p = binary.LittleEndian.AppendUint16(p, id)
+	}
+	if len(p)%4 != 0 {
+		p = append(p, 0, 0)
+	}
+	return UserDataBlock{Type: SCNet, Payload: p}.Encode()
+}

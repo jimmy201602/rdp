@@ -397,3 +397,15 @@ func TestXrdpValidClientBlobTypeIgnored(t *testing.T) {
 		t.Fatal("non-empty blob with wrong type accepted")
 	}
 }
+
+func TestEncodeValidClientAlert(t *testing.T) {
+	msg := EncodeValidClientAlert()
+	c := &Client{UserName: "u", MachineName: "m"}
+	reply, done, err := c.Handle(msg)
+	if err != nil || !done || reply != nil || c.Outcome != "valid-client" {
+		t.Fatalf("reply %x done %v err %v outcome %q", reply, done, err, c.Outcome)
+	}
+	if len(msg) != 16 || msg[0] != MsgErrorAlert || msg[1] != 0x03 {
+		t.Fatalf("alert %x", msg)
+	}
+}
