@@ -49,6 +49,8 @@ func main() {
 	targetMinTLS := flag.String("target-min-tls", "1.2", "lowest TLS version accepted from the target: 1.0, 1.1, 1.2 or 1.3 (Windows 7 only offers 1.0)")
 	allowUser := flag.String("allow-user", "", "comma-separated user names admitted by the route policy (empty: any)")
 	allowDomain := flag.String("allow-domain", "", "required domain (empty: any)")
+	nlaUsers := flag.String("nla-users", "", "enable front-end CredSSP/NLA: file with one user:password per line; clients offering PROTOCOL_HYBRID then authenticate with NTLMv2 before MCS and their delegated credentials go to the target")
+	requireNLA := flag.Bool("require-nla", false, "refuse clients that do not offer PROTOCOL_HYBRID (needs -nla-users)")
 	allowChannel := flag.String("allow-channel", "*", "comma-separated static virtual channels relayed to the target (\"*\": all, \"\": none), e.g. cliprdr,rdpdr,rdpsnd,drdynvc")
 	handshake := flag.Duration("handshake-timeout", 30*time.Second, "front-end handshake budget")
 	maxSessions := flag.Int("max-sessions", 16, "concurrent client connections")
@@ -104,6 +106,31 @@ func main() {
 		}
 	}
 
+	var lookup func(user, domain string) (string, bool)
+	if *nlaUsers != "" {
+		data, err := os.ReadFile(*nlaUsers)
+		if err != nil {
+			log.Fatal(err)
+		}
+		accounts := map[string]string{}
+		for i, line := range strings.Split(string(data), "\n") {
+			if line = strings.TrimSpace(line); line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			user, password, ok := strings.Cut(line, ":")
+			if user = strings.TrimSpace(user); !ok || user == "" || password == "" {
+				log.Fatalf("%s:%d: expected user:password", *nlaUsers, i+1)
+			}
+			accounts[strings.ToLower(user)] = password
+		}
+		lookup = func(user, _ string) (string, bool) {
+			password, ok := accounts[strings.ToLower(user)]
+			return password, ok
+		}
+	} else if *requireNLA {
+		log.Fatal("-require-nla needs -nla-users")
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	sessions := make(chan server.Summary, 16)
@@ -113,7 +140,9 @@ func main() {
 		}
 	}
 	gw, err := gateway.New(gateway.Config{
-		TLS: &tls.Config{Certificates: []tls.Certificate{cert}},
+		TLS:        &tls.Config{Certificates: []tls.Certificate{cert}},
+		NLA:        lookup,
+		RequireNLA: *requireNLA,
 		Route: func(_ context.Context, p server.Peer) (gateway.Target, error) {
 			if len(users) > 0 && !users[strings.ToLower(p.UserName)] {
 				return gateway.Target{}, errors.New("user not allowed")
@@ -130,7 +159,7 @@ func main() {
 		OnSession:        func(s server.Summary) { sessions <- s },
 		OnRelay: func(r gateway.Summary) {
 			rec := map[string]any{
-				"event": "relay", "remote": fmt.Sprint(r.RemoteAddr), "user": r.UserName, "target": r.Target, "end": r.End,
+				"event": "relay", "remote": fmt.Sprint(r.RemoteAddr), "user": r.UserName, "nla": r.NLA, "target": r.Target, "end": r.End,
 				"client_pdus": r.ClientPDUs, "client_fastpath": r.ClientFastPath, "server_pdus": r.ServerPDUs, "server_fastpath": r.ServerFastPath,
 				"client_bytes": r.ClientBytes, "server_bytes": r.ServerBytes, "input": r.InputEvents, "dropped_caps": fmt.Sprint(r.DroppedCapabilities),
 				"channels": fmt.Sprint(r.ChannelPDUs), "dropped_channels": fmt.Sprint(r.DroppedChannels), "reactivations": r.Reactivations, "duration_ms": r.Duration.Milliseconds(),
@@ -152,14 +181,21 @@ func main() {
 	if *targetNLA {
 		targetSecurity = "NLA/CredSSP"
 	}
-	log.Printf("gateway listening on %s (TLS only, users %q), target %s (%s)", ln.Addr(), *allowUser, *target, targetSecurity)
+	frontSecurity := "TLS only"
+	switch {
+	case *requireNLA:
+		frontSecurity = "NLA required"
+	case lookup != nil:
+		frontSecurity = "TLS, NLA offered"
+	}
+	log.Printf("gateway listening on %s (%s, users %q), target %s (%s)", ln.Addr(), frontSecurity, *allowUser, *target, targetSecurity)
 	done := make(chan error, 1)
 	go func() { done <- gw.Serve(ctx, ln) }()
 	for {
 		select {
 		case s := <-sessions:
 			rec := map[string]any{"event": "session", "remote": fmt.Sprint(s.RemoteAddr), "user": s.UserName, "client": s.ClientName,
-				"stage": s.Stage, "authorized": s.Authorized, "duration_ms": s.Duration.Milliseconds()}
+				"stage": s.Stage, "nla": s.NLA, "authorized": s.Authorized, "duration_ms": s.Duration.Milliseconds()}
 			if s.Err != nil {
 				rec["error"] = s.Err.Error()
 			}

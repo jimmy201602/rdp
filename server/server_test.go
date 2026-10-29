@@ -56,7 +56,7 @@ type harness struct {
 	logs      []string
 }
 
-func start(t *testing.T, authorize func(context.Context, Peer) error) *harness {
+func start(t *testing.T, authorize func(context.Context, Peer) error, tweaks ...func(*Config)) *harness {
 	t.Helper()
 	cert, pool := testCertificate(t)
 	h := &harness{pool: pool, done: make(chan error, 1)}
@@ -74,6 +74,9 @@ func start(t *testing.T, authorize func(context.Context, Peer) error) *harness {
 			h.summaries = append(h.summaries, s)
 			h.mu.Unlock()
 		},
+	}
+	for _, tweak := range tweaks {
+		tweak(&cfg)
 	}
 	srv, err := New(cfg)
 	if err != nil {
@@ -183,6 +186,85 @@ func TestLoopbackActivationAndGraphics(t *testing.T) {
 	s := h.waitSummary(t)
 	if !s.Authorized || s.UserName != "alice" || s.Stage != "output" || (s.Err != nil && !errors.Is(s.Err, context.Canceled)) {
 		t.Fatalf("summary %+v", s)
+	}
+}
+
+func withNLA(c *Config) {
+	c.NLA = func(user, _ string) (string, bool) {
+		if user == "alice" {
+			return "pw-not-logged", true
+		}
+		return "", false
+	}
+}
+
+// TestNLAFrontEnd covers PROTOCOL_HYBRID: CredSSP before MCS, the proven
+// identity and delegated password reaching Authorize, TLS-only clients
+// still admitted, logon failures denied before MCS, and RequireNLA.
+func TestNLAFrontEnd(t *testing.T) {
+	var got Peer
+	h := start(t, func(_ context.Context, p Peer) error { got = p; return nil }, withNLA)
+	opts := clientOpts(h)
+	opts.NLA = true
+	opts.Observe = 300 * time.Millisecond
+	res, err := transport.Activate(context.Background(), h.addr, opts)
+	if err != nil {
+		t.Fatalf("activate with NLA: %v (stage %s)", err, res.Stage)
+	}
+	if !res.NLA || res.CredSSPVersion != 6 || res.SelectedProtocol != wire.ProtocolHybrid || !res.ProtocolReconfirmed {
+		t.Fatalf("result %+v", res)
+	}
+	if !got.NLA || got.UserName != "alice" || got.Domain != "dom" || got.Password != "pw-not-logged" {
+		t.Fatalf("peer %+v", got)
+	}
+	plain := clientOpts(h)
+	plain.Observe = 300 * time.Millisecond
+	if res, err := transport.Activate(context.Background(), h.addr, plain); err != nil || res.NLA || res.SelectedProtocol != wire.ProtocolSSL {
+		t.Fatalf("TLS-only client with optional NLA: %v %+v", err, res)
+	}
+	h.mu.Lock()
+	for _, l := range h.logs {
+		if strings.Contains(l, "pw-not-logged") {
+			t.Errorf("password leaked into log: %q", l)
+		}
+	}
+	h.mu.Unlock()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		h.mu.Lock()
+		n := len(h.summaries)
+		h.mu.Unlock()
+		if n == 2 || time.Now().After(deadline) {
+			break
+		}
+	}
+	h.mu.Lock()
+	sums := append([]Summary{}, h.summaries...)
+	h.mu.Unlock()
+	if len(sums) != 2 || !sums[0].NLA || sums[1].NLA || !sums[0].Authorized || !sums[1].Authorized {
+		t.Fatalf("summaries %+v", sums)
+	}
+
+	bad := start(t, func(context.Context, Peer) error { return nil }, withNLA)
+	opts = clientOpts(bad)
+	opts.NLA, opts.Password = true, "wrong"
+	if _, err := transport.Activate(context.Background(), bad.addr, opts); !errors.Is(err, transport.ErrCredSSP) {
+		t.Fatalf("wrong password: %v", err)
+	}
+	if s := bad.waitSummary(t); s.Authorized || s.NLA || !errors.Is(s.Err, ErrDenied) || s.Stage != "tls" {
+		t.Fatalf("summary %+v", s)
+	}
+
+	strict := start(t, func(context.Context, Peer) error { return nil }, withNLA, func(c *Config) { c.RequireNLA = true })
+	_, err = transport.Activate(context.Background(), strict.addr, clientOpts(strict))
+	var nf *wire.NegotiationFailure
+	if !errors.As(err, &nf) || nf.Code != wire.FailureHybridRequiredByServer {
+		t.Fatalf("TLS-only client against RequireNLA: %v", err)
+	}
+	if s := strict.waitSummary(t); !errors.Is(s.Err, ErrNegotiation) {
+		t.Fatalf("summary %+v", s)
+	}
+	if _, err := New(Config{TLS: &tls.Config{Certificates: []tls.Certificate{{}}}, Authorize: func(context.Context, Peer) error { return nil }, RequireNLA: true}); !errors.Is(err, ErrConfig) {
+		t.Fatalf("RequireNLA without NLA: %v", err)
 	}
 }
 

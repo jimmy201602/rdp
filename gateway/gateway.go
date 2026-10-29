@@ -40,7 +40,7 @@ var (
 
 // Target is the backend a Route decision points to.
 type Target struct {
-	NLA        bool           // require backend CredSSP/NTLMv2 (front end remains TLS-only)
+	NLA        bool           // require CredSSP/NTLMv2 towards the target (independent of front-end NLA)
 	Address    string         // host:port
 	ServerName string         // TLS name to verify (default: host of Address)
 	RootCAs    *x509.CertPool // nil: system roots
@@ -57,6 +57,12 @@ type Config struct {
 	// Returning an error denies the client with
 	// ERRINFO_SERVER_DENIED_CONNECTION. Required.
 	Route func(ctx context.Context, p server.Peer) (Target, error)
+	// NLA enables CredSSP on the front end (see server.Config.NLA): the
+	// identity proven by NTLMv2 reaches Route in Peer and the credentials
+	// the client delegated are what the target receives. RequireNLA refuses
+	// clients that only offer TLS.
+	NLA        func(user, domain string) (password string, ok bool)
+	RequireNLA bool
 	// AllowCapability filters capability set types relayed in Demand /
 	// Confirm Active. nil uses DefaultAllowCapability.
 	AllowCapability func(typ uint16) bool
@@ -82,6 +88,7 @@ type Summary struct {
 	RemoteAddr          net.Addr
 	UserName, Domain    string
 	ClientName          string
+	NLA                 bool // front-end identity proven by CredSSP
 	Target              string
 	ClientPDUs          int // slow-path PDUs client -> target
 	ClientFastPath      int // fast-path input frames
@@ -137,6 +144,8 @@ func New(cfg Config) (*Gateway, error) {
 	g := &Gateway{cfg: cfg}
 	srv, err := server.New(server.Config{
 		TLS:              cfg.TLS,
+		NLA:              cfg.NLA,
+		RequireNLA:       cfg.RequireNLA,
 		Handler:          g.handle,
 		HandshakeTimeout: cfg.HandshakeTimeout,
 		MaxSessions:      cfg.MaxSessions,
@@ -196,7 +205,7 @@ func (g *Gateway) handle(ctx context.Context, c *server.Conn) error {
 	channels.bind(backend.StaticChannels())
 	g.cfg.Logf("%s: target %s licensed (user channel %d, channels %v), relaying", peer.RemoteAddr, target.Address, backend.UserChannel(), channels.names())
 	r := &relay{g: g, client: c, backend: backend, channels: channels, sum: Summary{
-		RemoteAddr: peer.RemoteAddr, UserName: peer.UserName, Domain: peer.Domain, ClientName: peer.ClientName,
+		RemoteAddr: peer.RemoteAddr, UserName: peer.UserName, Domain: peer.Domain, ClientName: peer.ClientName, NLA: peer.NLA,
 		Target: target.Address, InputEvents: map[string]int{}, DroppedCapabilities: map[uint16]int{},
 		ChannelPDUs: map[string]int{}, DroppedChannels: map[string]int{},
 	}}

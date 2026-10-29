@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"rdp.local/kernel/licensing"
+	"rdp.local/kernel/nla"
 	"rdp.local/kernel/wire"
 )
 
@@ -46,6 +48,10 @@ type session struct {
 	frame       *Frame
 	pending     []byte       // MCS PDU read ahead during channel joins
 	creds       *Credentials // kept only until Config.Handler returns
+	requested   uint32       // client's requestedProtocols, echoed in SC_CORE
+	selected    uint32       // PROTOCOL_SSL or PROTOCOL_HYBRID
+	leaf        *x509.Certificate
+	nla         *nla.ServerResult
 }
 
 func newSession(cfg Config, c net.Conn) *session {
@@ -54,7 +60,7 @@ func newSession(cfg Config, c net.Conn) *session {
 
 func (s *session) summary(err error, d time.Duration) Summary {
 	return Summary{RemoteAddr: s.peer.RemoteAddr, UserName: s.peer.UserName, Domain: s.peer.Domain, ClientName: s.peer.ClientName,
-		Stage: s.stage, Authorized: s.authorized, Err: err, Duration: d}
+		Stage: s.stage, NLA: s.peer.NLA, Authorized: s.authorized, Err: err, Duration: d}
 }
 
 func (s *session) logf(format string, args ...any) {
@@ -72,6 +78,7 @@ func (s *session) run(ctx context.Context) error {
 	}{
 		{"x224", s.negotiate},
 		{"tls", s.startTLS},
+		{"credssp", s.credssp},
 		{"mcs-connect", s.mcsConnect},
 		{"mcs-join", s.mcsJoin},
 		{"client-info", s.clientInfo},
@@ -146,23 +153,103 @@ func (s *session) negotiate(context.Context) error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrProtocol, err)
 	}
-	if !hasNeg || cr.RequestedProtocols&wire.ProtocolSSL == 0 {
-		_ = wire.WriteTPKT(s.raw, wire.EncodeNegotiationFailure(wire.FailureSSLRequiredByServer))
-		return fmt.Errorf("%w: client offered protocols 0x%08x without PROTOCOL_SSL", ErrNegotiation, cr.RequestedProtocols)
+	if hasNeg {
+		s.requested = cr.RequestedProtocols
 	}
-	return wire.WriteTPKT(s.raw, wire.EncodeConnectionConfirm(0, wire.ProtocolSSL))
+	switch {
+	case s.cfg.NLA != nil && s.requested&wire.ProtocolHybrid != 0:
+		s.selected = wire.ProtocolHybrid
+	case s.cfg.RequireNLA:
+		_ = wire.WriteTPKT(s.raw, wire.EncodeNegotiationFailure(wire.FailureHybridRequiredByServer))
+		return fmt.Errorf("%w: client offered protocols 0x%08x without PROTOCOL_HYBRID", ErrNegotiation, s.requested)
+	case s.requested&wire.ProtocolSSL != 0:
+		s.selected = wire.ProtocolSSL
+	default:
+		_ = wire.WriteTPKT(s.raw, wire.EncodeNegotiationFailure(wire.FailureSSLRequiredByServer))
+		return fmt.Errorf("%w: client offered protocols 0x%08x without PROTOCOL_SSL", ErrNegotiation, s.requested)
+	}
+	return wire.WriteTPKT(s.raw, wire.EncodeConnectionConfirm(0, s.selected))
 }
 
 func (s *session) startTLS(ctx context.Context) error {
 	if s.r.Buffered() != 0 {
 		return fmt.Errorf("%w: %d bytes sent before TLS handshake", ErrProtocol, s.r.Buffered())
 	}
-	tc := tls.Server(s.raw, s.cfg.TLS)
+	tc := tls.Server(s.raw, s.captureCertificate())
 	if err := tc.HandshakeContext(ctx); err != nil {
 		return fmt.Errorf("%w: TLS handshake: %v", ErrNegotiation, err)
 	}
 	s.conn = tc
 	s.r = bufio.NewReaderSize(tc, bufferSize)
+	return nil
+}
+
+// captureCertificate wraps the TLS config so the certificate actually
+// presented is known: CredSSP binds the client to its public key.
+func (s *session) captureCertificate() *tls.Config {
+	tc := s.cfg.TLS.Clone()
+	inner, certs := tc.GetCertificate, tc.Certificates
+	tc.Certificates = nil
+	tc.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		var cert *tls.Certificate
+		if inner != nil {
+			c, err := inner(hello)
+			if err != nil {
+				return nil, err
+			}
+			cert = c
+		}
+		for i := range certs {
+			if cert != nil {
+				break
+			}
+			if hello.SupportsCertificate(&certs[i]) == nil || i == len(certs)-1 {
+				cert = &certs[i]
+			}
+		}
+		if cert == nil || len(cert.Certificate) == 0 {
+			return nil, errors.New("no TLS certificate available")
+		}
+		leaf := cert.Leaf
+		if leaf == nil {
+			var err error
+			if leaf, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
+				return nil, err
+			}
+		}
+		s.leaf = leaf
+		return cert, nil
+	}
+	return tc
+}
+
+// --- CredSSP ------------------------------------------------------------------
+
+// credssp runs the server side of NLA when PROTOCOL_HYBRID was selected.
+// The proven identity replaces whatever the Client Info PDU will claim.
+func (s *session) credssp(context.Context) error {
+	if s.selected != wire.ProtocolHybrid {
+		return nil
+	}
+	if s.leaf == nil {
+		return fmt.Errorf("%w: TLS certificate unavailable for CredSSP", ErrNegotiation)
+	}
+	key, err := nla.PublicKey(s.leaf)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrNegotiation, err)
+	}
+	res, err := nla.Server(s.conn, nla.ServerConfig{PublicKey: key, Binding: nla.TLSServerEndPoint(s.leaf), Lookup: s.cfg.NLA})
+	if err != nil {
+		if errors.Is(err, nla.ErrLogonFailure) {
+			s.logf("CredSSP logon failure from client %s", s.raw.RemoteAddr())
+			return fmt.Errorf("%w: CredSSP: %v", ErrDenied, err)
+		}
+		return fmt.Errorf("%w: CredSSP: %v", ErrNegotiation, err)
+	}
+	s.nla = res
+	s.peer.NLA = true
+	s.peer.UserName, s.peer.Domain = res.Identity.User, res.Identity.Domain
+	s.logf("credssp v%d user %q domain %q spnego=%v delegated=%v bound=%v", res.Version, res.Identity.User, res.Identity.Domain, res.SPNEGO, res.Credentials != nil, res.ChannelBound)
 	return nil
 }
 
@@ -239,7 +326,7 @@ func (s *session) mcsConnect(context.Context) error {
 	}
 	s.userChannel = firstStaticChannel + uint16(len(channels))
 
-	core, err := wire.ServerCoreData{Version: 0x00080004, ClientRequestedProtocols: wire.ProtocolSSL, HasRequestedProtocols: true}.Encode()
+	core, err := wire.ServerCoreData{Version: 0x00080004, ClientRequestedProtocols: s.requested, HasRequestedProtocols: true}.Encode()
 	if err != nil {
 		return err
 	}
@@ -394,8 +481,17 @@ func (s *session) clientInfo(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrProtocol, err)
 	}
-	s.peer.Domain, s.peer.UserName = ci.Domain, ci.UserName
 	s.peer.AutoLogon = ci.Flags&wire.InfoAutoLogon != 0
+	if s.nla != nil {
+		// Client Info after NLA is not authenticated: keep the proven
+		// identity and use the delegated credentials (if any) downstream.
+		ci.Domain, ci.UserName, ci.Password = s.nla.Identity.Domain, s.nla.Identity.User, ""
+		if c := s.nla.Credentials; c != nil {
+			ci.Domain, ci.UserName, ci.Password = c.Domain, c.User, c.Password
+			s.nla.Credentials = nil
+		}
+	}
+	s.peer.Domain, s.peer.UserName = ci.Domain, ci.UserName
 	peer := s.peer
 	peer.Password = ci.Password
 	if s.cfg.Handler != nil {

@@ -6,10 +6,12 @@
 // desktop plus a colour pointer. Input is read and discarded (G3-2) and no
 // upstream target is contacted (G3-3).
 //
-// Security boundaries: Standard RDP Security and CredSSP/NLA are refused at
-// X.224 negotiation, passwords are never logged or kept after the
-// Authorize callback returns, and every connection has handshake, idle and
-// per-PDU size limits.
+// Security boundaries: Standard RDP Security is refused at X.224
+// negotiation; CredSSP/NLA (PROTOCOL_HYBRID, NTLMv2 via package nla) is
+// offered only when Config.NLA is set and can be made mandatory with
+// RequireNLA. Passwords are never logged or kept after the Authorize
+// callback returns, and every connection has handshake, idle and per-PDU
+// size limits.
 package server
 
 import (
@@ -45,12 +47,24 @@ type Peer struct {
 	Password      string
 	AutoLogon     bool
 	Channels      []string // static virtual channels the client asked for
+	// NLA reports that UserName/Domain were proven by CredSSP (NTLMv2)
+	// before MCS and that Password is the delegated credential (empty when
+	// the client delegated nothing).
+	NLA bool
 }
 
 // Config configures a Server.
 type Config struct {
 	// TLS must carry the server certificate; MinVersion defaults to 1.2.
 	TLS *tls.Config
+	// NLA enables CredSSP on the front end: clients offering PROTOCOL_HYBRID
+	// authenticate with NTLMv2 before MCS and the callback supplies the
+	// password for the user (domain as the client sent it, often empty);
+	// ok=false denies the logon. The proven identity and the delegated
+	// credentials then replace the Client Info ones. Clients offering only
+	// PROTOCOL_SSL are still admitted unless RequireNLA is set.
+	NLA        func(user, domain string) (password string, ok bool)
+	RequireNLA bool
 	// Authorize decides whether the peer may proceed. Returning an error
 	// (wrap ErrDenied or any other) sends ERRINFO_SERVER_DENIED_CONNECTION
 	// and closes the connection. Required unless Handler is set.
@@ -85,6 +99,7 @@ type Summary struct {
 	Domain     string
 	ClientName string
 	Stage      string // last completed stage
+	NLA        bool   // client authenticated with CredSSP
 	Authorized bool
 	Err        error
 	Duration   time.Duration
@@ -106,6 +121,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.Authorize == nil && cfg.Handler == nil {
 		return nil, fmt.Errorf("%w: Authorize policy or Handler required", ErrConfig)
+	}
+	if cfg.RequireNLA && cfg.NLA == nil {
+		return nil, fmt.Errorf("%w: RequireNLA needs an NLA lookup", ErrConfig)
 	}
 	tc := cfg.TLS.Clone()
 	if tc.MinVersion == 0 {
