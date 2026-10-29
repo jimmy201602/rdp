@@ -176,7 +176,7 @@ func capabilityExchange(conn net.Conn, opts Options, res *Result) (wire.DemandAc
 	sets := wire.DefaultClientCapabilities(wire.ClientCapabilityOptions{
 		DesktopWidth:   width,
 		DesktopHeight:  height,
-		ColorDepth:     24,
+		ColorDepth:     opts.colorDepth(),
 		KeyboardLayout: keyboardLayoutUS,
 		KeyboardType:   wire.KeyboardTypeIBMEnhance,
 		FunctionKeys:   keyboardFunctionKey,

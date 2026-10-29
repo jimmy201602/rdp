@@ -2,6 +2,7 @@
 set -eu
 
 install -d -m 755 /run/xrdp
+rm -f /run/xrdp/xrdp-sesman.pid /run/xrdp/xrdp.pid   # stale after `docker start` of a stopped container
 install -m 644 /certs/server.pem /etc/xrdp/test-cert.pem
 install -o xrdp -g xrdp -m 600 /certs/server-key.pem /etc/xrdp/test-key.pem
 sed -i \

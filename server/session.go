@@ -43,7 +43,8 @@ type session struct {
 	clientCaps  []wire.CapabilitySet
 	bpp         uint16
 	frame       *Frame
-	pending     []byte // MCS PDU read ahead during channel joins
+	pending     []byte       // MCS PDU read ahead during channel joins
+	creds       *Credentials // kept only until Config.Handler returns
 }
 
 func newSession(cfg Config, c net.Conn) *session {
@@ -74,10 +75,33 @@ func (s *session) run(ctx context.Context) error {
 		{"mcs-join", s.mcsJoin},
 		{"client-info", s.clientInfo},
 		{"license", s.license},
+	}
+	if s.cfg.Handler != nil {
+		steps = append(steps, struct {
+			name string
+			fn   func(context.Context) error
+		}{"handler", s.runHandler})
+		return s.runSteps(ctx, steps)
+	}
+	steps = append(steps, []struct {
+		name string
+		fn   func(context.Context) error
+	}{
 		{"capabilities", s.capabilities},
 		{"finalize", s.finalize},
 		{"output", s.output},
+	}...)
+	if err := s.runSteps(ctx, steps); err != nil {
+		return err
 	}
+	_ = s.conn.SetDeadline(time.Time{})
+	return s.serveActive(ctx)
+}
+
+func (s *session) runSteps(ctx context.Context, steps []struct {
+	name string
+	fn   func(context.Context) error
+}) error {
 	for _, st := range steps {
 		if err := st.fn(ctx); err != nil {
 			if ctx.Err() != nil {
@@ -92,8 +116,21 @@ func (s *session) run(ctx context.Context) error {
 		s.stage = st.name
 		s.logf("%s ok", st.name)
 	}
+	return nil
+}
+
+// runHandler hands the licensed connection to Config.Handler and wipes the
+// pass-through credentials when it returns.
+func (s *session) runHandler(ctx context.Context) error {
 	_ = s.conn.SetDeadline(time.Time{})
-	return s.serveActive(ctx)
+	c := &Conn{s: s}
+	if s.creds != nil {
+		c.creds = *s.creds
+		s.creds = nil
+	}
+	err := s.cfg.Handler(ctx, c)
+	c.creds = Credentials{}
+	return err
 }
 
 // --- X.224 --------------------------------------------------------------------
@@ -342,10 +379,16 @@ func (s *session) clientInfo(ctx context.Context) error {
 	s.peer.AutoLogon = ci.Flags&wire.InfoAutoLogon != 0
 	peer := s.peer
 	peer.Password = ci.Password
+	if s.cfg.Handler != nil {
+		s.creds = &Credentials{Domain: ci.Domain, UserName: ci.UserName, Password: ci.Password}
+	}
 	ci.Password = ""
-	err = s.cfg.Authorize(ctx, peer)
+	if s.cfg.Authorize != nil {
+		err = s.cfg.Authorize(ctx, peer)
+	}
 	peer.Password = ""
 	if err != nil {
+		s.creds = nil
 		s.logf("policy denied user %q domain %q client %q: %v", s.peer.UserName, s.peer.Domain, s.peer.ClientName, err)
 		// Finish licensing first so clients expecting SEC_LICENSE_PKT
 		// (FreeRDP, our transport) then see the Set Error Info PDU as an
@@ -357,7 +400,7 @@ func (s *session) clientInfo(ctx context.Context) error {
 		_ = s.writeMCS(wire.EncodeDisconnectProviderUltimatum(wire.DisconnectReasonProviderInit))
 		return fmt.Errorf("%w: %v", ErrDenied, err)
 	}
-	s.authorized = true
+	s.authorized = s.cfg.Authorize != nil
 	return nil
 }
 

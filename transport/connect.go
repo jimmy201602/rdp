@@ -156,7 +156,7 @@ func basicSettingsExchange(conn net.Conn, opts Options, res *Result) error {
 		KeyboardFunctionKey:    keyboardFunctionKey,
 		PostBeta2ColorDepth:    wire.ColorDepth8bpp,
 		ClientProductID:        1,
-		HighColorDepth:         wire.HighColorDepth24,
+		HighColorDepth:         opts.colorDepth(),
 		SupportedColorDepths:   wire.SupportColorDepths24 | wire.SupportColorDepths16 | wire.SupportColorDepths15 | wire.SupportColorDepths32,
 		EarlyCapabilityFlags:   wire.CapSupportErrInfoPDU,
 		ServerSelectedProtocol: res.SelectedProtocol,

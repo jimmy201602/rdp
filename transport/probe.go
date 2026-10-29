@@ -47,6 +47,9 @@ type Options struct {
 	// DesktopWidth/DesktopHeight are advertised in Client Core Data. Zero
 	// means 1024x768.
 	DesktopWidth, DesktopHeight uint16
+	// ColorDepth is the highColorDepth requested in Client Core Data and
+	// the preferred depth in Confirm Active: 15, 16 or 24 (0 means 24).
+	ColorDepth uint16
 
 	// Domain, UserName and Password fill the Client Info PDU sent by
 	// Activate. A non-empty Password sets INFO_AUTOLOGON and makes the
@@ -64,6 +67,14 @@ type Options struct {
 	// DesktopHeight, and pointer updates into Result.Pointer; both are
 	// summarised in Observation.Frame / Observation.Pointer.
 	Render bool
+}
+
+func (o Options) colorDepth() uint16 {
+	switch o.ColorDepth {
+	case 15, 16, 24:
+		return o.ColorDepth
+	}
+	return 24
 }
 
 // Stage names in the order they are reached.

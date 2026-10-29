@@ -1,4 +1,4 @@
-# 验证环境与结果（G1 协商 + TLS，G2 第一段 MCS/GCC + Channel Join，G2 第二段 Client Info → Font Map，G2 第三段 Font Map 后观察，G2 第四段位图解码，G2 第五段 Fast-Path 输出 + 指针渲染，G3-1 服务端角色 + xfreerdp 真实客户端）
+# 验证环境与结果（G1 协商 + TLS，G2 第一段 MCS/GCC + Channel Join，G2 第二段 Client Info → Font Map，G2 第三段 Font Map 后观察，G2 第四段位图解码，G2 第五段 Fast-Path 输出 + 指针渲染，G3-1 服务端角色 + xfreerdp 真实客户端，G3-3 网关 xfreerdp → rdpgw → xrdp）
 
 本文记录隔离 xrdp 互操作环境的搭建方式、执行命令和实际结果。结论覆盖 TPKT/X.224/RDP 安全协商、TLS 服务器认证、MCS Connect-Initial/Response 与 GCC Basic Settings Exchange（含协商结果重确认）、Erect Domain / Attach User / Channel Join（用户通道 + I/O 通道）、Client Info、MS-RDPELE 许可、Demand/Confirm Active 能力交换和 Synchronize/Control/Font List/Font Map 连接收尾。G2 第三段在 Font Map 后保持连接读取服务端输出（Slow-Path Update / Pointer / Save Session Info 分类计数）；G2 第四段把 Bitmap Update 解码（Interleaved RLE）到帧缓冲并导出 PNG，在 xrdp 上得到完整的登录界面和 xfce 桌面画面（见 5.5）；G2 第五段声明 FASTPATH_OUTPUT_SUPPORTED，读循环同时处理 TPKT 与 fast-path PDU，并把指针更新解码成 RGBA 光标（见 5.6）。G3-1 反向实现服务端角色（`server` 包 / `rdpserve`），用 Go 客户端回环 e2e 和 VM 上的真实 xfreerdp 2.6.1 + Xvfb 验证了协商、TLS、Client Info 策略、许可、能力交换、收尾和位图/光标输出（见 5.7）。orders、输入、虚拟通道未实现；带测试账号时 xrdp 侧日志记录登录成功并启动了 Xorg 会话，但 xrdp 不发 Save Session Info，协议层没有登录通知（见 5.4）。
 
@@ -40,6 +40,8 @@ Dockerfile 用 digest 固定基础镜像，apt 包未固定版本；重新构建
 | `cmd/rdpprobe` | 探测器 CLI；`-ca` 指定信任的 PEM 根证书，`-server-name` 指定 SNI/校验名，`-stage tls|channel-join|client-info|license|capabilities|activated`（默认 channel-join）控制停止阶段，`-client-name` 设置 Client Core Data 中的客户端名，`-user`/`-domain`/`-password-env` 填 Client Info（密码只从环境变量读取，不出现在命令行、报告或日志；给出密码才设置 INFO_AUTOLOGON），`-observe <时长>`（仅配合 `-stage activated`，否则拒绝）在 Font Map 后继续读取服务端输出并计数（Update 类型、位图矩形/压缩/字节、orders 数、指针类型、Save Session Info、Set Error Info、Deactivate All 重激活次数）并把 Bitmap Update 解码到 `-stage` 所用桌面尺寸（1024x768）的帧缓冲（报告 `framebuffer:` 行 / JSON `observation.frame`：矩形数、RLE 数、裁剪数、写入像素、覆盖率、色深、脏区、解码错误、像素 SHA-256），`-png <文件>`（需 `-observe`）把帧缓冲写成 PNG（指针位置已知且可见时合成光标），`-cursor-png <文件>` 写当前光标形状；报告另有 `fast-path:` 行（fast-path PDU 数、各 updateCode 计数、分片重组数）和 `pointer:` 行（解码光标数、缓存命中/缺失、可见性、位置、当前光标尺寸/热点/色深/SHA-256、错误），JSON 为 `observation.fastpath_pdus/fastpath_updates/fragments/pointer`；`-timeout` 自动加上观察时长，`-json` 输出报告 |
 | `server` 包 / `cmd/rdpserve` | G3-1 服务端角色与验证 CLI：`rdpserve -listen 127.0.0.1:33891 -user demo -password-env RDP_DEMO_PASSWORD [-cert/-key] [-once] [-json]`；不给证书时生成临时自签名证书（仅测试）；`-json` 每个会话结束输出一行（remote/user/domain/client/stage/authorized/duration_ms/error，无密码）|
 | `bitmap` 包 | Interleaved RLE 解压、RGBA 帧缓冲、指针 XOR/AND 掩码解码与缓存、光标合成（单测 + fuzz），只依赖标准库与 `wire` |
+| `transport.Session` / `server.Handler`+`server.Conn` | G3-3 基础：`transport.Dial` 走完 TLS → MCS → Client Info → 许可后保留连接，`ReadPDU`（慢路径 I/O 通道 payload 或整帧 fast-path）/`WriteIO`/`WriteFastPath`/`Disconnect`；`server.Config.Handler` 在许可完成后把连接交给调用方（`Conn.Peer/Credentials/ReadPDU/WriteIO/WriteFastPath/Deny/Disconnect`），`Credentials` 只在 Handler 返回前有效，返回后清零；不设 Handler 时保持 G3-1 演示服务端行为 |
+| `gateway` 包 / `cmd/rdpgw` | G3-3 网关：`Route(ctx, Peer) (Target, error)` 策略选目标（拒绝 → Set Error Info DENIED + DPU），凭据只向目标透传一次（Client Info，不进日志/Summary），Demand Active / Confirm Active 按 `AllowCapability` 白名单过滤（默认丢 Surface Commands、Bitmap Codecs、Frame Ack、RAIL/Window/NineGrid/GDI+/CompDesk），其余 Share Control PDU 改写 pduSource 为目标分配的用户通道，fast-path 两向整帧转发，慢路径/fast-path 输入解码计数（只计类别，不记扫描码/坐标），任一侧结束就给另一侧发 DPU 并清理；`rdpgw -listen … -cert/-key -target host:port -target-ca ca.pem -target-name name [-allow-user u]... [-allow-domain d]... [-target-timeout] [-handshake-timeout] [-max-sessions] [-once] [-json]`，`-json` 每会话输出 session 行和 relay 行（PDU/fast-path 计数、字节、输入类别计数、丢弃的能力类型、重激活次数、结束方 client-closed/target-closed/canceled/error） |
 
 `.testenv/`（证书、测试账号）与 `.build/` 已在 `.gitignore` 中，不入库。
 
@@ -86,6 +88,13 @@ RDP_TEST_PASSWORD=$(head -n1 go-kernel/.testenv/account/password) ./rdpprobe-lin
 RDP_TEST_PASSWORD=$(head -n1 go-kernel/.testenv/account/password) ./rdpprobe-linux-amd64 -addr 127.0.0.1:33890 \
     -server-name localhost -ca "$CA" -stage activated -observe 15s -user "$(head -n1 go-kernel/.testenv/account/user)" -password-env RDP_TEST_PASSWORD
 docker exec rdp-go-kernel-xrdp tail -n 30 /var/log/xrdp-sesman.log   # 登录结果只在服务端日志里
+# G3-3 网关：前端用同一套测试证书（xfreerdp 校验名 localhost），后端信任测试 CA
+(cd go-kernel && CGO_ENABLED=0 go build -o ../rdpgw ./cmd/rdpgw)
+C=go-kernel/.testenv/certs
+./rdpgw -listen 127.0.0.1:33892 -cert $C/server.pem -key $C/server-key.pem -target 127.0.0.1:33890 -target-ca $C/ca.pem -target-name localhost -allow-user rdptest -json &
+export DISPLAY=:99; export RDP_PW=$(head -n1 go-kernel/.testenv/account/password)   # 必须 export，sh -c 内才能展开
+sh -c 'xfreerdp /v:127.0.0.1:33892 /u:rdptest /p:"$RDP_PW" /cert:ignore /sec:tls /size:1024x768 /bpp:24 -clipboard /log-level:INFO' &
+sleep 8; import -window root gw-desktop.png; xdotool mousemove 50 12 click 1   # 经网关点开 xfce 菜单
 ./rdpprobe-linux-amd64 -addr 127.0.0.1:33890 -server-name localhost -ca "$CA" -stage activated -observe 8s -png login.png   # 解码位图并导出画面（xrdp 登录界面）
 RDP_TEST_PASSWORD=$(head -n1 go-kernel/.testenv/account/password) ./rdpprobe-linux-amd64 -addr 127.0.0.1:33890 \
     -server-name localhost -ca "$CA" -stage activated -observe 15s -user "$(head -n1 go-kernel/.testenv/account/user)" -password-env RDP_TEST_PASSWORD -png desktop.png -cursor-png cursor.png   # xfce 桌面 + 当前光标
@@ -198,6 +207,24 @@ VM 真实客户端：Ubuntu 22.04 `apt install freerdp2-x11`（xfreerdp 2.6.1）
 
 说明：xfreerdp 2.6.1 在 CS_NET 请求 cliprdr/rdpdr/rdpsnd/drdynvc 等静态通道，服务端按请求顺序分配 1004 起的通道号并接受加入，通道数据被丢弃；客户端激活后发送的 fast-path 输入（鼠标移动）被按长度丢弃，未解析。截图中光标由 Xvfb/xfreerdp 合成，截图工具不含光标，彩色指针只能确认 xfreerdp 无错误接收（Go 客户端回环中已逐字段往返）。mstsc / Windows 客户端未测。
 
+### 5.8 G3-3（2026-10-29，网关：xfreerdp → rdpgw → xrdp）
+
+本地/VM：`gofmt`/`go vet`/`golangci-lint`/`CGO_ENABLED=0 go test ./...` 通过，`go test -race -count=3 ./gateway ./server ./transport` 通过。`gateway` 单测：`TestRelayEndToEnd`（Go 客户端 `transport.Activate` → gateway → `server.Serve` 演示服务端：目标收到透传的用户名/密码、客户端激活并收到图案、Summary 为 client-closed）、`TestRouteDenied`（`ERRINFO_SERVER_DENIED_CONNECTION`）、`TestTargetUnreachable`、`TestTargetRejectsPassedThroughCredentials`（目标策略拒绝 → 客户端 DENIED，`ErrBackend`）、`TestCapabilityFilter`；`wire` 新增 `input_test.go`（慢路径/fast-path 输入解码）。修过一个 relay 结束分类竞态：首个结束方确定后才取消上下文并关闭另一侧，否则 `AfterFunc` 关闭会把 client-closed 记成 target-closed。
+
+VM 真实链路：Ubuntu 22.04 + Xvfb :99，xfreerdp 2.6.1 → `rdpgw 127.0.0.1:33892`（前端用 `.testenv/certs/server.pem`，后端 `-target-ca ca.pem -target-name localhost`）→ Docker xrdp 0.9.24 `127.0.0.1:33890`，xdotool 3.20211022.1 注入输入。
+
+| 用例 | 结果 |
+|---|---|
+| `xfreerdp /v:127.0.0.1:33892 /u:rdptest /p:… /cert:ignore /sec:tls /size:1024x768 /bpp:24` | 网关 `x224 ok → … → license ok → target 127.0.0.1:33890 licensed (user channel 1004), relaying`；xrdp 日志 `Connected client computer name: devin-box`、`login successful for user rdptest on display 10`、`connected ok`（sesman `++ reconnected session`/`created session`）；6 s 后截图为完整 xfce 桌面（顶栏 Applications/时钟/`rdptest`、底部 dock），非 xrdp 登录窗 |
+| 同上，`xdotool` 点 Applications 菜单 → Esc → 点 dock 终端 → 键入 `echo gateway-ok` 回车 | 截图 1：xfce 应用菜单展开；截图 2：uxterm 中显示 `$ echo gateway-ok` / `gateway-ok`。relay 行：`client 5 pdus + 44 fast-path, target 72 pdus + 5 fast-path, input map[mouse:8 scancode:38 sync:2], dropped caps map[6:1 28:1 29:1 30:1], reactivations 0`，server_bytes 268076；输入全部是 fast-path 整帧转发，统计只有类别计数 |
+| `/u:nobody`（策略只允许 rdptest） | 网关 `route denied user "nobody" client "devin-box": user not allowed`，session 行 `"authorized":false,"stage":"license"`，未拨号目标；xfreerdp `ERRINFO_SERVER_DENIED_CONNECTION (0x00000007)` 退出 |
+| `-target 127.0.0.1:33999`（目标不可达） | 网关 `target 127.0.0.1:33999 failed at handshake: dial: … connection refused`，session 行 `"authorized":true,"stage":"license","error":"rdp gateway: target connection failed…"`；xfreerdp 收到 `ERRINFO_SERVER_DENIED_CONNECTION` 退出 |
+| 客户端 `kill -9 xfreerdp` / Ctrl-C | relay `ended (client-closed)`（客户端读到 EOF），网关向 xrdp 发 DPU，xrdp 日志 `xrdp_mcs_recv failed` 后结束该连接；session 行 `"stage":"handler","authorized":true` |
+| 杀掉容器内 `xrdp --nodaemon`（目标断开） | relay `ended (target-closed)`，网关向客户端发 DPU（provider initiated），xfreerdp `ERRINFO_RPC_INITIATED_DISCONNECT (0x00000001)` 退出 |
+| `rdpprobe -stage activated -observe` 经网关 | `reached stage: activated`，framebuffer 1024x768 155 rects 100% covered，fast-path `ptr-new:2 synchronize:1`，与直连 xrdp 一致 |
+
+说明：xrdp 对网关发的 Demand Active 丢了类型 6（xrdp 自定义 / 未在 MS-RDPBCGR 中定义）、28 Surface Commands、29 Bitmap Codecs、30 Frame Acknowledge，xfreerdp 因而只用 orders + 位图更新，桌面仍完整；xrdp 全程无 Deactivate All（重激活路径只有单测）。排错记录：一次“登录窗 + 黑屏”是测试脚本问题——`sh -c '…$RDP_PW…'` 未 `export` 导致密码为空，xrdp 按规则关掉 autologin 显示登录窗（`xrdp_sec.c`：cbPassword==0 → rdp_autologin=0），黑屏则是 xfreerdp 已退出后 Xvfb 的裸根窗口；`docker start` 已停止的 xrdp 容器会因残留 `xrdp-sesman.pid` 启动失败，`start-xrdp.sh` 现在先删除陈旧 pid 文件。
+
 ## 6. 本轮验证不覆盖
 
 - 用户认证结果的协议层判定：无 NLA/CredSSP；xrdp 侧日志确认 INFO_AUTOLOGON 凭据登录成功并启动了 Xorg 会话，但观察窗口内没有收到任何 Save Session Info，探测器不能自行判定登录结果；Save Session Info / Set Error Info 解码只经单元测试验证。错误密码用例未跑（xrdp 失败时同样只在服务端日志体现）。
@@ -205,5 +232,6 @@ VM 真实客户端：Ubuntu 22.04 `apt install freerdp2-x11`（xfreerdp 2.6.1）
 - 图形：只解码 Slow-Path Bitmap Update（xrdp 上只出现 24bpp RLE，8/15/16/32bpp、未压缩位图和 Palette 只经单测；解码正确性靠肉眼比对 PNG，没有逐像素参考）；orders 不解析，Surface Commands 只计数；fast-path 分片重组、压缩标志拒绝、Large Pointer、Pointer Position 合成只经单测（xrdp 更新都很小、不发位置）；输入；其余 Share Data PDU 只按 pduType2 计数。
 - 静态虚拟通道（客户端请求 0 个）、消息通道、多传输通道；服务端若分配未请求的通道会被拒绝。
 - 真实 Windows 目标、公网目标、Standard RDP Security 服务器（探测器按设计拒绝）。
+- 网关：静态虚拟通道数据（cliprdr/rdpdr/rdpsnd/drdynvc）在前端被丢弃、不向目标转发（目标侧 Dial 不请求通道，xrdp 日志 `drdynvc not found`）；没有 NLA/CredSSP（前后端都是 TLS-only，目标要求 NLA 时握手失败）；目标证书必须经 `-target-ca`/系统根验证，无跳过选项；被过滤的能力（codecs/Surface Commands/Frame Ack/RAIL 等）意味着不支持 RemoteFX/GFX、RemoteApp；输入只透传并计数，不做键盘布局改写或策略拦截；重激活（Deactivate All）、客户端 Shutdown Request、多会话并发上限、握手超时只在单测/代码路径上；真实 Windows 目标与 mstsc 客户端未测。
 - 服务端角色：只对 xfreerdp 2.6.1 验证，mstsc/Windows 客户端、NLA 客户端（被按设计降到 TLS 或拒绝）、多显示器、Auto-Reconnect、重激活（Deactivate All → 新 Demand Active）、Shutdown Request 真实路径、空闲超时、并发上限（只有单元/手工路径）未在真实客户端上验证；位图只发未压缩矩形，没有压缩编码、fast-path 输出、orders；输入被丢弃；不连接上游目标。
 - 证书验证关闭或降级路径：不存在该选项，也不计划提供。

@@ -53,8 +53,13 @@ type Config struct {
 	TLS *tls.Config
 	// Authorize decides whether the peer may proceed. Returning an error
 	// (wrap ErrDenied or any other) sends ERRINFO_SERVER_DENIED_CONNECTION
-	// and closes the connection. Required.
+	// and closes the connection. Required unless Handler is set.
 	Authorize func(ctx context.Context, p Peer) error
+	// Handler, when set, takes over the connection after licensing (the
+	// gateway relay): it receives the pass-through credentials and owns
+	// the capability exchange and the active session. Desktop, Pointer and
+	// IdleTimeout are then unused.
+	Handler func(ctx context.Context, c *Conn) error
 	// Desktop returns the frame to push after activation. Defaults to a
 	// test pattern at the client's requested size.
 	Desktop func(p Peer) *Frame
@@ -99,8 +104,8 @@ func New(cfg Config) (*Server, error) {
 	if cfg.TLS == nil || len(cfg.TLS.Certificates) == 0 && cfg.TLS.GetCertificate == nil {
 		return nil, fmt.Errorf("%w: TLS certificate required", ErrConfig)
 	}
-	if cfg.Authorize == nil {
-		return nil, fmt.Errorf("%w: Authorize policy required", ErrConfig)
+	if cfg.Authorize == nil && cfg.Handler == nil {
+		return nil, fmt.Errorf("%w: Authorize policy or Handler required", ErrConfig)
 	}
 	tc := cfg.TLS.Clone()
 	if tc.MinVersion == 0 {
