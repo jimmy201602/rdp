@@ -1,0 +1,5 @@
+/.build/
+/.testenv/
+*.test
+*.prof
+coverage.out
