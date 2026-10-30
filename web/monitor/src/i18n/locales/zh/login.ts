@@ -1,0 +1,15 @@
+export default {
+  title: 'RDP 会话监控',
+  mode: { user: '用户登录', token: '访问令牌' },
+  user: '用户名',
+  userRequired: '请输入用户名',
+  password: '密码',
+  passwordRequired: '请输入密码',
+  submit: '登录',
+  userHelp: '账号来自网关的 <code>-web-users</code> 文件。登录后可在浏览器里直接连接远程桌面。',
+  token: '访问令牌',
+  tokenPlaceholder: '与 -monitor-token 一致，未设置时留空',
+  enter: '进入',
+  tokenHelp: '令牌仅用于查看与协同；浏览器发起连接需要用户登录。',
+  tokenInvalid: '令牌无效或网关不可达',
+};

@@ -3,9 +3,11 @@ import { App, Button, Card, Input, Popconfirm, Space, Table, Tag, Typography } f
 import { DeleteOutlined, DownloadOutlined, PlayCircleOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import dayjs from 'dayjs';
+import { useTranslation } from 'react-i18next';
 import { account, api, downloadURL, endLabels, fmtBytes, fmtDuration, type RecordingMeta } from '../api';
 
 export default function Recordings() {
+  const { t } = useTranslation(['recordings', 'common']);
   const nav = useNavigate();
   const { message } = App.useApp();
   const [rows, setRows] = useState<RecordingMeta[]>([]);
@@ -36,12 +38,12 @@ export default function Recordings() {
 
   return (
     <Card
-      title="录像列表"
+      title={t('title')}
       extra={
         <Space>
-          <Input.Search placeholder="用户 / 目标 / 客户端" allowClear value={q} onChange={(e) => setQ(e.target.value)} style={{ width: 240 }} />
+          <Input.Search placeholder={t('searchPlaceholder')} allowClear value={q} onChange={(e) => setQ(e.target.value)} style={{ width: 240 }} />
           <Button icon={<ReloadOutlined />} onClick={() => void load()}>
-            刷新
+            {t('common:action.refresh')}
           </Button>
         </Space>
       }
@@ -51,17 +53,17 @@ export default function Recordings() {
         rowKey="id"
         loading={loading}
         dataSource={data}
-        locale={{ emptyText: '没有录像（网关需加 -record-dir）' }}
+        locale={{ emptyText: t('empty') }}
         columns={[
-          { title: '开始时间', dataIndex: 'started', render: (v) => dayjs(v).format('YYYY-MM-DD HH:mm:ss'), defaultSortOrder: 'descend', sorter: (a, b) => dayjs(a.started).valueOf() - dayjs(b.started).valueOf() },
-          { title: '用户', render: (_, r) => account(r) },
-          { title: '目标', dataIndex: 'target' },
-          { title: '客户端', dataIndex: 'remote_addr' },
-          { title: '分辨率', render: (_, r) => (r.width ? `${r.width}×${r.height}` : '-') },
-          { title: '时长', dataIndex: 'duration_ms', render: fmtDuration, sorter: (a, b) => a.duration_ms - b.duration_ms },
-          { title: '大小', dataIndex: 'size', render: fmtBytes, sorter: (a, b) => a.size - b.size },
+          { title: t('column.started'), dataIndex: 'started', render: (v) => dayjs(v).format('YYYY-MM-DD HH:mm:ss'), defaultSortOrder: 'descend', sorter: (a, b) => dayjs(a.started).valueOf() - dayjs(b.started).valueOf() },
+          { title: t('column.user'), render: (_, r) => account(r) },
+          { title: t('column.target'), dataIndex: 'target' },
+          { title: t('column.client'), dataIndex: 'remote_addr' },
+          { title: t('column.resolution'), render: (_, r) => (r.width ? `${r.width}×${r.height}` : '-') },
+          { title: t('column.duration'), dataIndex: 'duration_ms', render: fmtDuration, sorter: (a, b) => a.duration_ms - b.duration_ms },
+          { title: t('column.size'), dataIndex: 'size', render: fmtBytes, sorter: (a, b) => a.size - b.size },
           {
-            title: '结束',
+            title: t('column.end'),
             dataIndex: 'end',
             render: (v: string, r) => (
               <Space size={4}>
@@ -71,20 +73,20 @@ export default function Recordings() {
             ),
           },
           {
-            title: '操作',
+            title: t('column.actions'),
             render: (_, r) => (
               <Space>
                 <Button type="primary" icon={<PlayCircleOutlined />} onClick={() => nav(`/recordings/${r.id}`)}>
-                  回放
+                  {t('play')}
                 </Button>
                 <Button icon={<DownloadOutlined />} href={downloadURL(r.id)} />
                 <Popconfirm
-                  title="删除该录像？"
-                  okText="删除"
-                  cancelText="取消"
+                  title={t('deleteConfirm')}
+                  okText={t('common:action.delete')}
+                  cancelText={t('common:action.cancel')}
                   onConfirm={async () => {
                     await api.deleteRecording(r.id);
-                    message.success('已删除');
+                    message.success(t('deleted'));
                     void load();
                   }}
                 >

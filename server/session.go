@@ -27,6 +27,7 @@ const (
 	maxFinalizationPDUs        = 16
 	maxPointerCacheSize uint16 = 25 // clients keep the smaller of ours and theirs
 	maxBitmapPayload           = 16 << 10
+	bitmapTile                 = 64
 	bufferSize                 = 16 << 10
 )
 
@@ -320,6 +321,7 @@ func (s *session) mcsConnect(context.Context) error {
 	if s.peer.ColorDepth == 0 {
 		s.peer.ColorDepth = 8
 	}
+	s.bpp = sessionDepth(c)
 	for i, ch := range channels {
 		s.peer.Channels = append(s.peer.Channels, ch.Name)
 		s.channelIDs = append(s.channelIDs, firstStaticChannel+uint16(i))
@@ -436,6 +438,13 @@ func (s *session) readData() (uint16, []byte, error) {
 		if s.pending != nil {
 			mcs, s.pending = s.pending, nil
 		} else {
+			// mstsc may send fast-path input before finalization completes.
+			if hdr, err := s.r.Peek(1); err == nil && hdr[0] != 3 {
+				if err := s.discardFastPath(); err != nil {
+					return 0, nil, err
+				}
+				continue
+			}
 			var err error
 			if mcs, err = s.readMCS(); err != nil {
 				return 0, nil, err
@@ -551,7 +560,7 @@ func (s *session) serverCapabilities() []wire.CapabilitySet {
 			RefreshRectSupport: 1, SuppressOutputSupport: 1,
 		}.Set(),
 		wire.BitmapCapability{
-			PreferredBitsPerPixel: 24, DesktopWidth: w, DesktopHeight: h, DesktopResizeFlag: 1,
+			PreferredBitsPerPixel: s.demandDepth(), DesktopWidth: w, DesktopHeight: h, DesktopResizeFlag: 1,
 			DrawingFlags:             wire.DrawAllowDynamicColorFidelity | wire.DrawAllowColorSubsampling | wire.DrawAllowSkipAlpha,
 			MultipleRectangleSupport: 1,
 		}.Set(),
@@ -586,7 +595,7 @@ func (s *session) capabilities(context.Context) error {
 		return fmt.Errorf("%w: Confirm Active shareId 0x%08x, want 0x%08x", ErrProtocol, ca.ShareID, shareID)
 	}
 	s.clientCaps = ca.Capabilities
-	s.bpp = 24
+	s.bpp = s.demandDepth()
 	if set, ok := wire.FindCapability(ca.Capabilities, wire.CapsTypeBitmap); ok {
 		bc, err := wire.DecodeBitmapCapability(set)
 		if err != nil {
@@ -606,6 +615,29 @@ func (s *session) capabilities(context.Context) error {
 		return fmt.Errorf("%w: Confirm Active without General Capability Set", ErrProtocol)
 	}
 	return nil
+}
+
+// sessionDepth picks the colour depth announced in Demand Active. mstsc
+// draws bitmap updates at the depth the server announced, so it must match
+// what sendRegion encodes; FreeRDP tolerates a mismatch, mstsc does not.
+func sessionDepth(c wire.ClientCoreData) uint16 {
+	if c.EarlyCapabilityFlags&wire.CapWant32BPPSession != 0 && c.SupportedColorDepths&wire.SupportColorDepths32 != 0 {
+		return 32
+	}
+	switch c.HighColorDepth {
+	case 24:
+		return 24
+	case 8, 15, 16:
+		return 16
+	}
+	return 24
+}
+
+func (s *session) demandDepth() uint16 {
+	if s.bpp == 0 {
+		return 24
+	}
+	return s.bpp
 }
 
 // --- Finalization ---------------------------------------------------------------
@@ -703,18 +735,30 @@ func (s *session) sendFrame() error {
 }
 
 // sendRegion pushes a clipped, 4-pixel-aligned region of f as uncompressed
-// bitmap rectangles, each at most maxBitmapPayload bytes.
+// bitmap tiles of at most bitmapTile x bitmapTile pixels. mstsc renders
+// wide, few-row strips as interleaved garbage, so tiles mirror what Windows
+// servers send.
 func (s *session) sendRegion(f *Frame, x, y, w, h int) error {
 	x0, y0 := max(x, 0)&^3, max(y, 0)
 	x1, y1 := min((x+w+3)&^3, int(f.Width)), min(y+h, int(f.Height))
 	if x0 >= x1 || y0 >= y1 {
 		return nil
 	}
-	stride := (x1 - x0) * int(s.bpp) / 8
-	rowsPer := maxBitmapPayload / stride
-	if rowsPer < 1 {
-		rowsPer = 1
+	for ty := y0; ty < y1; ty += bitmapTile {
+		for tx := x0; tx < x1; tx += bitmapTile {
+			if err := s.sendTile(f, tx, ty, min(tx+bitmapTile, x1), min(ty+bitmapTile, y1)); err != nil {
+				return err
+			}
+		}
 	}
+	return nil
+}
+
+func (s *session) sendTile(f *Frame, x0, y0, x1, y1 int) error {
+	stride := (x1 - x0) * int(s.bpp) / 8
+	// Leave room for the share/update headers: the MCS Send Data payload
+	// must stay within 16383 bytes.
+	rowsPer := max((maxBitmapPayload-256)/stride, 1)
 	for y := y0; y < y1; y += rowsPer {
 		yEnd := min(y+rowsPer, y1)
 		bd, err := wire.NewBitmapData(uint16(x0), uint16(y), uint16(x1-x0), uint16(yEnd-y), s.bpp, false, f.region(x0, y, x1, yEnd, s.bpp))

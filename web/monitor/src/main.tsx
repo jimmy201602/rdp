@@ -2,6 +2,10 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { ConfigProvider, App as AntApp } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
+import enUS from 'antd/locale/en_US';
+import { useTranslation } from 'react-i18next';
+import './i18n';
+import { currentLanguage } from './i18n';
 import 'antd/dist/reset.css';
 import './monitor.css';
 import { createHashRouter, RouterProvider } from 'react-router-dom';
@@ -31,12 +35,20 @@ const router = createHashRouter([
 ]);
 
 // Exchange a stored API token for the stream cookie before any page opens a WebSocket.
-void tokenSession().finally(() => ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode>
-    <ConfigProvider locale={zhCN} theme={{ token: { colorPrimary: '#1677ff' } }}>
+// Root re-renders on language change (useTranslation) so antd's own texts follow.
+function Root() {
+  useTranslation();
+  return (
+    <ConfigProvider locale={currentLanguage() === 'en' ? enUS : zhCN} theme={{ token: { colorPrimary: '#1677ff' } }}>
       <AntApp>
         <RouterProvider router={router} />
       </AntApp>
     </ConfigProvider>
+  );
+}
+
+void tokenSession().finally(() => ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <Root />
   </React.StrictMode>,
 ));

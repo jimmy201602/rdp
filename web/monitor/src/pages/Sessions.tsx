@@ -3,9 +3,11 @@ import { App, Button, Card, Popconfirm, Space, Table, Tag, Typography } from 'an
 import { EyeOutlined, DisconnectOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import dayjs from 'dayjs';
+import { useTranslation } from 'react-i18next';
 import { account, api, fmtBytes, fmtDuration, type SessionInfo } from '../api';
 
 export default function Sessions() {
+  const { t } = useTranslation(['sessions', 'common']);
   const { message } = App.useApp();
   const nav = useNavigate();
   const [rows, setRows] = useState<SessionInfo[]>([]);
@@ -26,19 +28,19 @@ export default function Sessions() {
 
   useEffect(() => {
     void load();
-    const t = setInterval(() => {
+    const timer = setInterval(() => {
       setNow(Date.now());
       void load();
     }, 2000);
-    return () => clearInterval(t);
+    return () => clearInterval(timer);
   }, []);
 
   return (
     <Card
-      title="活动会话"
+      title={t('title')}
       extra={
         <Button icon={<ReloadOutlined />} onClick={() => void load()}>
-          刷新
+          {t('common:action.refresh')}
         </Button>
       }
     >
@@ -48,40 +50,40 @@ export default function Sessions() {
         loading={loading}
         dataSource={rows}
         pagination={false}
-        locale={{ emptyText: '当前没有会话' }}
+        locale={{ emptyText: t('empty') }}
         columns={[
-          { title: '用户', render: (_, s) => account(s) },
-          { title: '客户端', dataIndex: 'remote_addr', render: (v, s) => (s.client_name ? `${v} (${s.client_name})` : v) },
-          { title: '目标', dataIndex: 'target' },
-          { title: '分辨率', render: (_, s) => (s.width ? `${s.width}×${s.height}` : '-') },
-          { title: '开始时间', dataIndex: 'started', render: (v) => dayjs(v).format('HH:mm:ss') },
-          { title: '时长', render: (_, s) => fmtDuration(now - dayjs(s.started).valueOf()) },
-          { title: '流量', dataIndex: 'server_bytes', render: fmtBytes },
+          { title: t('col.user'), render: (_, s) => account(s) },
+          { title: t('col.client'), dataIndex: 'remote_addr', render: (v, s) => (s.client_name ? `${v} (${s.client_name})` : v) },
+          { title: t('col.target'), dataIndex: 'target' },
+          { title: t('col.resolution'), render: (_, s) => (s.width ? `${s.width}×${s.height}` : '-') },
+          { title: t('col.started'), dataIndex: 'started', render: (v) => dayjs(v).format('HH:mm:ss') },
+          { title: t('col.duration'), render: (_, s) => fmtDuration(now - dayjs(s.started).valueOf()) },
+          { title: t('col.traffic'), dataIndex: 'server_bytes', render: fmtBytes },
           {
-            title: '观看',
+            title: t('col.viewers'),
             render: (_, s) => (
               <Space size={4}>
-                <Tag>{s.viewers} 人</Tag>
-                {s.controllers > 0 && <Tag color="gold">{s.controllers} 人协同</Tag>}
-                {s.recording && <Tag color="red">录制中</Tag>}
-                {s.decode_errors > 0 && <Tag color="orange">解码异常 {s.decode_errors}</Tag>}
+                <Tag>{t('tag.viewers', { count: s.viewers })}</Tag>
+                {s.controllers > 0 && <Tag color="gold">{t('tag.controllers', { count: s.controllers })}</Tag>}
+                {s.recording && <Tag color="red">{t('tag.recording')}</Tag>}
+                {s.decode_errors > 0 && <Tag color="orange">{t('tag.decodeErrors', { count: s.decode_errors })}</Tag>}
               </Space>
             ),
           },
           {
-            title: '操作',
+            title: t('col.actions'),
             render: (_, s) => (
               <Space>
                 <Button type="primary" icon={<EyeOutlined />} onClick={() => nav(`/live/${s.id}`)}>
-                  监控
+                  {t('watch')}
                 </Button>
                 <Popconfirm
-                  title="断开该会话？"
-                  okText="断开"
-                  cancelText="取消"
+                  title={t('disconnectConfirm')}
+                  okText={t('disconnect')}
+                  cancelText={t('common:action.cancel')}
                   onConfirm={async () => {
                     await api.disconnect(s.id);
-                    message.success('已断开');
+                    message.success(t('disconnected'));
                     void load();
                   }}
                 >

@@ -17,6 +17,8 @@ G3-1（服务端角色最小链路）：`server` 包实现 TLS-only 的 RDP 服�
 内核要求 `CGO_ENABLED=0` 可构建，使用 Go 标准库，不引入协议替身。UI、OCR 和视频导出属于后续独立审核范围。
 
 - 迁移计划：`../docs/development/closed-source-go-kernel-plan.md`
+- 使用文档（部署、参数、Web 界面）：`docs/USAGE.md`
+- 开发文档（架构、构建测试、API、前端 i18n）：`docs/DEVELOPMENT.md`
 - 来源和边界：`docs/SOURCES.md`
 - 测试环境、执行步骤与实际结果：`docs/VALIDATION.md`
 

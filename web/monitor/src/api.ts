@@ -1,3 +1,5 @@
+import i18n from './i18n';
+
 export interface SessionInfo {
   id: string;
   web?: boolean;
@@ -102,7 +104,7 @@ export const clearOwnerKey = (id: string) => sessionStorage.removeItem(ownerKeyN
 
 export class AuthError extends Error {
   constructor() {
-    super('需要访问令牌');
+    super(i18n.t('api:authRequired'));
   }
 }
 
@@ -201,12 +203,26 @@ export function fmtDuration(ms: number): string {
 
 export const account = (s: { user: string; domain?: string }) => (s.domain ? `${s.domain}\\${s.user}` : s.user || '-');
 
-export const endLabels: Record<string, string> = {
-  'client-closed': '客户端断开',
-  'target-closed': '目标断开',
-  'monitor-disconnect': '监控端强制断开',
-  canceled: '网关停止',
-  error: '错误',
-  interrupted: '录像中断',
-  recording: '录制中',
-};
+const endKeys = {
+  'client-closed': 'clientClosed',
+  'target-closed': 'targetClosed',
+  'monitor-disconnect': 'monitorDisconnect',
+  canceled: 'canceled',
+  error: 'error',
+  interrupted: 'interrupted',
+  recording: 'recording',
+} as const;
+
+// endLabels resolves on each lookup so labels follow the current language.
+export const endLabels: Record<string, string> = new Proxy({} as Record<string, string>, {
+  get: (_, k) =>
+    typeof k === 'string' && Object.prototype.hasOwnProperty.call(endKeys, k)
+      ? i18n.t(`api:end.${endKeys[k as keyof typeof endKeys]}`)
+      : undefined,
+  has: (_, k) => typeof k === 'string' && Object.prototype.hasOwnProperty.call(endKeys, k),
+  ownKeys: () => Object.keys(endKeys),
+  getOwnPropertyDescriptor: (_, k) =>
+    typeof k === 'string' && Object.prototype.hasOwnProperty.call(endKeys, k)
+      ? { enumerable: true, configurable: true, value: i18n.t(`api:end.${endKeys[k as keyof typeof endKeys]}`) }
+      : undefined,
+});

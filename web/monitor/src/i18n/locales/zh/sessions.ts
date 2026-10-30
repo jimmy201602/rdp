@@ -1,0 +1,25 @@
+export default {
+  title: '活动会话',
+  empty: '当前没有会话',
+  col: {
+    user: '用户',
+    client: '客户端',
+    target: '目标',
+    resolution: '分辨率',
+    started: '开始时间',
+    duration: '时长',
+    traffic: '流量',
+    viewers: '观看',
+    actions: '操作',
+  },
+  tag: {
+    viewers: '{{count}} 人',
+    controllers: '{{count}} 人协同',
+    recording: '录制中',
+    decodeErrors: '解码异常 {{count}}',
+  },
+  watch: '监控',
+  disconnectConfirm: '断开该会话？',
+  disconnect: '断开',
+  disconnected: '已断开',
+};

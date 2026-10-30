@@ -1,6 +1,7 @@
 // Decoder and renderer for the monitor's record stream (monitor/record.go):
 // record = kind u8 | time u32 | len u32 | payload, little-endian.
 import type { RecordingMeta } from './api';
+import i18n from './i18n';
 
 export const REC_FRAME = 1;
 export const REC_KEY = 2;
@@ -37,7 +38,7 @@ export interface Recording {
 export function parseRecording(buf: ArrayBuffer): Recording {
   const dv = new DataView(buf);
   const magic = new TextDecoder().decode(new Uint8Array(buf, 0, Math.min(4, buf.byteLength)));
-  if (buf.byteLength < 10 || magic !== 'RDPV' || dv.getUint16(4, true) !== 1) throw new Error('不是 RDPV v1 录像文件');
+  if (buf.byteLength < 10 || magic !== 'RDPV' || dv.getUint16(4, true) !== 1) throw new Error(i18n.t('api:notRdpv'));
   const metaLen = dv.getUint32(6, true);
   const meta = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 10, metaLen))) as RecordingMeta;
   const records: Rec[] = [];

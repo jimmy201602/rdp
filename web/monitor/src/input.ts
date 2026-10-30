@@ -1,3 +1,4 @@
+import i18n from './i18n';
 // Viewer input encoding for the live WebSocket (monitor/http.go): 9-byte
 // events kind u8 | flags u16 | code u16 | x u16 | y u16 with slow-path flags.
 
@@ -168,16 +169,16 @@ const K = {
 
 // Shortcuts the browser or the local OS would keep for itself.
 export const SHORTCUTS: { key: string; label: string; events: () => InputEvent[] }[] = [
-  { key: 'win', label: 'Win（开始菜单）', events: () => combo(K.win) },
-  { key: 'alttab', label: 'Alt+Tab（切换窗口）', events: () => combo(K.alt, K.tab) },
-  { key: 'winr', label: 'Win+R（运行）', events: () => combo(K.win, K.r) },
-  { key: 'wine', label: 'Win+E（资源管理器）', events: () => combo(K.win, K.e) },
-  { key: 'wind', label: 'Win+D（显示桌面）', events: () => combo(K.win, K.d) },
-  { key: 'winl', label: 'Win+L（锁定）', events: () => combo(K.win, K.l) },
+  { key: 'win', get label() { return i18n.t('live:shortcuts.win'); }, events: () => combo(K.win) },
+  { key: 'alttab', get label() { return i18n.t('live:shortcuts.alttab'); }, events: () => combo(K.alt, K.tab) },
+  { key: 'winr', get label() { return i18n.t('live:shortcuts.winr'); }, events: () => combo(K.win, K.r) },
+  { key: 'wine', get label() { return i18n.t('live:shortcuts.wine'); }, events: () => combo(K.win, K.e) },
+  { key: 'wind', get label() { return i18n.t('live:shortcuts.wind'); }, events: () => combo(K.win, K.d) },
+  { key: 'winl', get label() { return i18n.t('live:shortcuts.winl'); }, events: () => combo(K.win, K.l) },
   { key: 'ctrlesc', label: 'Ctrl+Esc', events: () => combo(K.ctrl, K.esc) },
-  { key: 'ctrlshiftesc', label: 'Ctrl+Shift+Esc（任务管理器）', events: () => combo(K.ctrl, K.shift, K.esc) },
-  { key: 'altf4', label: 'Alt+F4（关闭窗口）', events: () => combo(K.alt, K.f4) },
-  { key: 'prtsc', label: 'PrintScreen（截屏）', events: () => combo(K.prtsc) },
+  { key: 'ctrlshiftesc', get label() { return i18n.t('live:shortcuts.ctrlshiftesc'); }, events: () => combo(K.ctrl, K.shift, K.esc) },
+  { key: 'altf4', get label() { return i18n.t('live:shortcuts.altf4'); }, events: () => combo(K.alt, K.f4) },
+  { key: 'prtsc', get label() { return i18n.t('live:shortcuts.prtsc'); }, events: () => combo(K.prtsc) },
 ];
 
 export const ctrlAltDel = (): InputEvent[] => [

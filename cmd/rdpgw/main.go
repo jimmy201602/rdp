@@ -70,6 +70,7 @@ func main() {
 	targetName := flag.String("target-name", "", "TLS name to verify on the target (default: target host)")
 	targetPin := flag.String("target-pin", "", "hex SHA-256 of the target's leaf certificate; pins it instead of CA/name verification (self-signed Windows hosts; rdpprobe -json reports peer_sha256). With -login-form a comma-separated host=sha256 list pins several hosts")
 	targetTimeout := flag.Duration("target-timeout", 20*time.Second, "target handshake budget")
+	frontMinTLS := flag.String("min-tls", "1.2", "lowest TLS version accepted from RDP clients: 1.0, 1.1, 1.2 or 1.3 (mstsc on an unpatched Windows 7 only offers 1.0)")
 	targetMinTLS := flag.String("target-min-tls", "1.2", "lowest TLS version accepted from the target: 1.0, 1.1, 1.2 or 1.3 (Windows 7 only offers 1.0)")
 	allowUser := flag.String("allow-user", "", "comma-separated user names admitted by the route policy (empty: any)")
 	allowDomain := flag.String("allow-domain", "", "required domain (empty: any)")
@@ -159,6 +160,10 @@ func main() {
 	if !ok {
 		log.Fatalf("-target-min-tls: unknown version %q", *targetMinTLS)
 	}
+	frontTLS, ok := map[string]uint16{"1.0": tls.VersionTLS10, "1.1": tls.VersionTLS11, "1.2": tls.VersionTLS12, "1.3": tls.VersionTLS13}[*frontMinTLS]
+	if !ok {
+		log.Fatalf("-min-tls: unknown version %q", *frontMinTLS)
+	}
 	var pool *x509.CertPool
 	if *targetCA != "" {
 		pem, err := os.ReadFile(*targetCA)
@@ -237,7 +242,7 @@ func main() {
 		return nil
 	}
 	cfg := gateway.Config{
-		TLS:        &tls.Config{Certificates: []tls.Certificate{cert}},
+		TLS:        &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: frontTLS},
 		NLA:        lookup,
 		RequireNLA: *requireNLA,
 		Route: func(_ context.Context, p server.Peer) (gateway.Target, error) {

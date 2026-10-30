@@ -16,6 +16,7 @@ import {
   SoundOutlined,
 } from '@ant-design/icons';
 import { useNavigate, useParams } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import { account, api, clearOwnerKey, fmtBytes, getOwnerKey, liveURL, type SessionInfo } from '../api';
 import { parseRecord, Renderer, REC_END } from '../rdpv';
 import { ctrlAltDel, encodeEvents, keyEvents, mouseButton, mouseMove, releaseModifiers, SHORTCUTS, unicodeText, Wheel, type InputEvent } from '../input';
@@ -48,6 +49,7 @@ export default function Live() {
   const { id = '' } = useParams();
   const nav = useNavigate();
   const { message } = App.useApp();
+  const { t } = useTranslation(['live', 'common']);
   const view = useRef<ScreenHandle>(null);
   const box = useRef<HTMLDivElement>(null);
   const ws = useRef<WebSocket | null>(null);
@@ -124,7 +126,7 @@ export default function Live() {
             else if (!hello.drive && folder.current) socket.send(JSON.stringify({ t: 'map', name: folder.current.name }));
             setDrive(hello.drive && folder.current ? hello.drive : '');
           }
-          if (control && !hello.control) message.warning('网关未开启 -monitor-control，仅能观看');
+          if (control && !hello.control) message.warning(t('msg.controlDisabled'));
           return;
         }
         if (msg.t === 'clip') {
@@ -137,12 +139,12 @@ export default function Live() {
           setCanResize(!!msg.resize);
         } else if (msg.t === 'reconnect') {
           if (msg.attempt > 0) {
-            message.loading({ key: 'target-reconnect', content: `与远程主机的连接中断，正在重连（第 ${msg.attempt} 次）…`, duration: 0 });
+            message.loading({ key: 'target-reconnect', content: t('msg.targetReconnecting', { n: msg.attempt }), duration: 0 });
           } else {
-            message.success({ key: 'target-reconnect', content: '已重新连接远程主机', duration: 3 });
+            message.success({ key: 'target-reconnect', content: t('msg.targetReconnected'), duration: 3 });
           }
         } else if (msg.t === 'drive') {
-          if (msg.error) message.error(`映射失败：${msg.error}`);
+          if (msg.error) message.error(t('msg.mapFailed', { error: msg.error }));
           setDrive(msg.name ?? '');
         } else if (msg.t === 'fs') {
           const f = folder.current;
@@ -176,7 +178,7 @@ export default function Live() {
       if (!droppedAt.current) droppedAt.current = Date.now();
       if (Date.now() - droppedAt.current > RECONNECT_FOR) {
         setState('error');
-        setError('与网关的连接已中断，重连失败');
+        setError(t('msg.gatewayReconnectFailed'));
         return;
       }
       setState('reconnecting');
@@ -218,7 +220,7 @@ export default function Live() {
         setClipText(clip.text ?? '');
         setClipImage(pngURL(clip));
         sendCtl({ t: 'clip', ...clip });
-        if (skippedImage) message.warning('剪贴板图片超过 2.9 MB，只同步了文字');
+        if (skippedImage) message.warning(t('msg.clipImageTooLarge'));
       }
     } catch {
       // Permission denied or document not focused: the panel still works.
@@ -303,14 +305,14 @@ export default function Live() {
     try {
       const f = new BrowserFolder(await pickFolder());
       if (!(await f.permitted())) {
-        message.error('浏览器未授予该文件夹的读写权限');
+        message.error(t('msg.folderPermissionDenied'));
         return;
       }
       await folder.current?.close();
       folder.current = f;
       sendCtl({ t: 'map', name: f.name });
     } catch (e) {
-      if ((e as DOMException).name !== 'AbortError') message.error(`选择文件夹失败：${(e as Error).message}`);
+      if ((e as DOMException).name !== 'AbortError') message.error(t('msg.pickFolderFailed', { error: (e as Error).message }));
     }
   };
 
@@ -325,7 +327,7 @@ export default function Live() {
 
   const disconnect = async () => {
     await api.disconnect(id);
-    message.success('已断开');
+    message.success(t('msg.disconnected'));
   };
 
   // With display control (Windows 8.1 / 2012 R2 and later) the remote
@@ -381,29 +383,29 @@ export default function Live() {
   const title = (
     <Space>
       <Button icon={<ArrowLeftOutlined />} onClick={() => nav('/')}>
-        返回
+        {t('common:action.back')}
       </Button>
       <span>{info ? `${account(info)} → ${info.target}` : id}</span>
-      {live && <Tag color="green">实时</Tag>}
-      {state === 'reconnecting' && <Tag color="orange">重连中…</Tag>}
-      {state === 'ended' && <Tag>会话已结束</Tag>}
-      {granted && <Tag color="gold">协同控制中</Tag>}
+      {live && <Tag color="green">{t('tag.live')}</Tag>}
+      {state === 'reconnecting' && <Tag color="orange">{t('tag.reconnecting')}</Tag>}
+      {state === 'ended' && <Tag>{t('tag.ended')}</Tag>}
+      {granted && <Tag color="gold">{t('tag.controlling')}</Tag>}
     </Space>
   );
 
   const extra = (
     <Space wrap>
-      <Tooltip title="开启后你的键盘和鼠标会与原用户一起操作该会话">
-        <Switch checkedChildren="协同" unCheckedChildren="旁观" checked={control} onChange={setControl} disabled={state === 'ended'} />
+      <Tooltip title={t('control.tooltip')}>
+        <Switch checkedChildren={t('control.on')} unCheckedChildren={t('control.off')} checked={control} onChange={setControl} disabled={state === 'ended'} />
       </Tooltip>
       <Button disabled={!granted || !live} onClick={() => send(ctrlAltDel())}>
         Ctrl+Alt+Del
       </Button>
       <Button icon={<FullscreenOutlined />} onClick={() => void box.current?.requestFullscreen()}>
-        全屏
+        {t('toolbar.fullscreen')}
       </Button>
       <Button danger icon={<DisconnectOutlined />} disabled={state === 'ended'} onClick={() => void disconnect()}>
-        断开
+        {t('toolbar.disconnect')}
       </Button>
     </Space>
   );
@@ -413,8 +415,8 @@ export default function Live() {
   return (
     <Card className={owned ? 'rdp-own' : undefined} title={owned ? undefined : title} extra={owned ? undefined : extra}>
       {error && !owned && <Alert type="error" showIcon message={error} style={{ marginBottom: 12 }} />}
-      {state === 'reconnecting' && !owned && <Alert type="warning" showIcon message="与网关的连接中断，正在重连。" style={{ marginBottom: 12 }} />}
-      {granted && !owned && <Alert type="warning" showIcon message="协同控制已开启：你的操作会直接作用于用户的桌面。" style={{ marginBottom: 12 }} />}
+      {state === 'reconnecting' && !owned && <Alert type="warning" showIcon message={t('alert.gatewayReconnecting')} style={{ marginBottom: 12 }} />}
+      {granted && !owned && <Alert type="warning" showIcon message={t('alert.controlActive')} style={{ marginBottom: 12 }} />}
       <div className={`monitor-workspace live-workspace${owned ? ' no-aside' : ''}`}>
         <div className="monitor-stage">
           <div ref={box} tabIndex={-1} className="screen-box" style={{ outline: 'none' }} onPointerEnter={() => void pushClipboard()}>
@@ -440,35 +442,35 @@ export default function Live() {
           </div>
           {info && !owned && (
             <Descriptions size="small" column={{ xs: 1, sm: 2, md: 2, lg: 2, xl: 2, xxl: 3 }} style={{ marginTop: 16 }}>
-              <Descriptions.Item label="客户端">{info.remote_addr}</Descriptions.Item>
-              <Descriptions.Item label="分辨率">{size[0] ? `${size[0]}×${size[1]}` : '-'}</Descriptions.Item>
-              <Descriptions.Item label="流量">{fmtBytes(info.server_bytes)}</Descriptions.Item>
-              <Descriptions.Item label="观看">
-                {info.viewers} 人{info.controllers ? `（${info.controllers} 人协同）` : ''}
+              <Descriptions.Item label={t('info.client')}>{info.remote_addr}</Descriptions.Item>
+              <Descriptions.Item label={t('info.resolution')}>{size[0] ? `${size[0]}×${size[1]}` : '-'}</Descriptions.Item>
+              <Descriptions.Item label={t('info.traffic')}>{fmtBytes(info.server_bytes)}</Descriptions.Item>
+              <Descriptions.Item label={t('info.viewers')}>
+                {t('info.viewerCount', { n: info.viewers })}{info.controllers ? t('info.controllerCount', { n: info.controllers }) : ''}
               </Descriptions.Item>
-              <Descriptions.Item label="画面帧">{info.frames}</Descriptions.Item>
-              <Descriptions.Item label="注入事件">{info.injected}</Descriptions.Item>
-              <Descriptions.Item label="解码异常">{info.decode_errors}</Descriptions.Item>
-              <Descriptions.Item label="录像">{info.recording ? '录制中' : '未开启'}</Descriptions.Item>
+              <Descriptions.Item label={t('info.frames')}>{info.frames}</Descriptions.Item>
+              <Descriptions.Item label={t('info.injected')}>{info.injected}</Descriptions.Item>
+              <Descriptions.Item label={t('info.decodeErrors')}>{info.decode_errors}</Descriptions.Item>
+              <Descriptions.Item label={t('info.recording')}>{info.recording ? t('info.recordingOn') : t('info.recordingOff')}</Descriptions.Item>
             </Descriptions>
           )}
           {!owned && <Events events={events} live />}
         </div>
         {!owned && (
-          <aside className="monitor-aside" aria-label="用户映射磁盘">
+          <aside className="monitor-aside" aria-label={t('aside.userDrive')}>
             <DriveBrowser key={id} id={id} ended={state === 'ended'} web={!!info?.web} />
           </aside>
         )}
       </div>
       {owned && (
         <div className="rdp-toolbar" style={{ top: barTop }}>
-          <Tooltip title="拖动可上下移动" placement="left">
+          <Tooltip title={t('aside.dragHint')} placement="left">
             <div className="rdp-toolbar-handle" onPointerDown={startDrag} onPointerMove={drag} onPointerUp={endDrag}>
               <HolderOutlined />
             </div>
           </Tooltip>
           {state === 'reconnecting' && (
-            <Tooltip title="与网关的连接中断，正在重连" placement="left">
+            <Tooltip title={t('aside.gatewayReconnecting')} placement="left">
               <div className="rdp-toolbar-status">
                 <LoadingOutlined />
               </div>
@@ -478,17 +480,17 @@ export default function Live() {
             <Popover
               trigger="click"
               placement="left"
-              title="剪贴板"
+              title={t('clipboard.title')}
               content={
                 <div style={{ width: 320 }}>
                   <Input.TextArea
                     rows={5}
                     value={clipText}
                     onChange={(e) => setClipText(e.target.value)}
-                    placeholder="远程复制的文字会出现在这里；输入或粘贴后点“发送”即可在远程粘贴"
+                    placeholder={t('clipboard.placeholder')}
                   />
                   {clipImage && (
-                    <img src={clipImage} alt="剪贴板图片" style={{ display: 'block', maxWidth: '100%', maxHeight: 160, marginTop: 8, objectFit: 'contain' }} />
+                    <img src={clipImage} alt={t('clipboard.imageAlt')} style={{ display: 'block', maxWidth: '100%', maxHeight: 160, marginTop: 8, objectFit: 'contain' }} />
                   )}
                   <Button
                     type="primary"
@@ -499,18 +501,18 @@ export default function Live() {
                       lastClip.current = clipKey({ text: clipText });
                       setClipImage('');
                       sendCtl({ t: 'clip', text: clipText });
-                      message.success('已发送到远程剪贴板');
+                      message.success(t('clipboard.sent'));
                     }}
                   >
-                    发送到远程
+                    {t('clipboard.send')}
                   </Button>
                   <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0, fontSize: 12 }}>
-                    切回本页时自动同步本机剪贴板（文字、HTML 格式、图片），远程复制的内容自动写入本机。
+                    {t('clipboard.hint')}
                   </Typography.Paragraph>
                 </div>
               }
             >
-              <Tooltip title="剪贴板" placement="left">
+              <Tooltip title={t('clipboard.title')} placement="left">
                 <Button type="text" icon={<CopyOutlined />} />
               </Tooltip>
             </Popover>
@@ -521,9 +523,9 @@ export default function Live() {
                 placement="bottomRight"
                 menu={{
                   items: [
-                    { key: 'name', label: `已映射：${drive}`, disabled: true },
-                    { key: 'change', label: '更换文件夹', icon: <FolderOpenOutlined /> },
-                    { key: 'unmap', label: '取消映射', danger: true },
+                    { key: 'name', label: t('drive.mapped', { drive }), disabled: true },
+                    { key: 'change', label: t('drive.change'), icon: <FolderOpenOutlined /> },
+                    { key: 'unmap', label: t('drive.unmap'), danger: true },
                   ],
                   onClick: ({ key }) => void (key === 'unmap' ? unmapFolder() : mapFolder()),
                 }}
@@ -534,14 +536,14 @@ export default function Live() {
             ) : (
               <Tooltip
                 placement="left"
-                title={folderSupported() ? '映射本地文件夹到远程（刷新页面后需重新选择）' : '映射文件夹需要 Chrome / Edge，并通过 HTTPS 或 localhost 访问'}
+                title={folderSupported() ? t('drive.mapTooltip') : t('drive.unsupported')}
               >
                 <Button type="text" icon={<FolderOpenOutlined />} disabled={!live || !folderSupported()} onClick={() => void mapFolder()} />
               </Tooltip>
             ))}
           <Tooltip
             placement="left"
-            title={muted ? '取消静音' : heardAudio && !audioReady ? '点击页面任意处即可播放远程声音' : '静音'}
+            title={muted ? t('audio.unmute') : heardAudio && !audioReady ? t('audio.clickToPlay') : t('audio.mute')}
           >
             <Button
               type="text"
@@ -565,21 +567,21 @@ export default function Live() {
               },
             }}
           >
-            <Tooltip title="发送快捷键（全屏时可直接按 Win、Alt+Tab 等）" placement="left">
+            <Tooltip title={t('toolbar.shortcutsTooltip')} placement="left">
               <Button type="text" icon={<MacCommandOutlined />} />
             </Tooltip>
           </Dropdown>
-          <Tooltip title="发送 Ctrl+Alt+Del" placement="left">
+          <Tooltip title={t('toolbar.ctrlAltDel')} placement="left">
             <Button type="text" icon={<LockOutlined />} disabled={!live} onClick={() => send(ctrlAltDel())} />
           </Tooltip>
-          <Tooltip title={fullscreen ? '退出全屏' : '全屏'} placement="left">
+          <Tooltip title={fullscreen ? t('toolbar.exitFullscreen') : t('toolbar.fullscreen')} placement="left">
             <Button
               type="text"
               icon={fullscreen ? <FullscreenExitOutlined /> : <FullscreenOutlined />}
               onClick={() => void (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen())}
             />
           </Tooltip>
-          <Tooltip title="断开" placement="left">
+          <Tooltip title={t('toolbar.disconnect')} placement="left">
             <Button type="text" danger icon={<DisconnectOutlined />} disabled={state === 'ended'} onClick={() => void disconnect()} />
           </Tooltip>
         </div>
@@ -588,10 +590,10 @@ export default function Live() {
         <div className="rdp-ended">
           <Card>
             <Typography.Title level={5} style={{ marginTop: 0 }}>
-              {state === 'ended' ? '会话已结束' : error || '连接中断'}
+              {state === 'ended' ? t('tag.ended') : error || t('ended.connectionLost')}
             </Typography.Title>
             <Button type="primary" onClick={() => nav('/connect')}>
-              返回连接页
+              {t('ended.backToConnect')}
             </Button>
           </Card>
         </div>

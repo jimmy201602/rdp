@@ -2,11 +2,14 @@ import { useEffect, useState } from 'react';
 import { Layout, Menu, Typography, Button, Modal, Input, Space, Tag } from 'antd';
 import { DesktopOutlined, PlaySquareOutlined, KeyOutlined, LinkOutlined, LoginOutlined, LogoutOutlined } from '@ant-design/icons';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
+import { useTranslation, Trans } from 'react-i18next';
 import { api, getToken, setToken, type MonitorInfo } from './api';
+import LanguageSwitch from './components/LanguageSwitch';
 
 const { Header, Content } = Layout;
 
 export default function Shell() {
+  const { t } = useTranslation();
   const nav = useNavigate();
   const loc = useLocation();
   const [info, setInfo] = useState<MonitorInfo | null>(null);
@@ -30,7 +33,7 @@ export default function Shell() {
     <Layout style={{ minHeight: '100vh' }}>
       <Header style={{ display: 'flex', alignItems: 'center', gap: 24 }}>
         <Typography.Title level={5} style={{ color: '#fff', margin: 0, whiteSpace: 'nowrap' }}>
-          RDP 会话监控
+          {t('app.title')}
         </Typography.Title>
         <Menu
           theme="dark"
@@ -39,14 +42,14 @@ export default function Shell() {
           style={{ flex: 1, minWidth: 0 }}
           onClick={({ key }) => nav(paths[key] ?? '/')}
           items={[
-            { key: 'sessions', icon: <DesktopOutlined />, label: '实时监控' },
-            ...(info?.web ? [{ key: 'connect', icon: <LinkOutlined />, label: '连接远程桌面' }] : []),
-            { key: 'recordings', icon: <PlaySquareOutlined />, label: '录像回放' },
+            { key: 'sessions', icon: <DesktopOutlined />, label: t('nav.sessions') },
+            ...(info?.web ? [{ key: 'connect', icon: <LinkOutlined />, label: t('nav.connect') }] : []),
+            { key: 'recordings', icon: <PlaySquareOutlined />, label: t('nav.recordings') },
           ]}
         />
         <Space>
-          {info?.control && <Tag color="gold">协同已开启</Tag>}
-          {info && !info.recording && <Tag>未开启录像</Tag>}
+          {info?.control && <Tag color="gold">{t('shell.controlOn')}</Tag>}
+          {info && !info.recording && <Tag>{t('shell.recordingOff')}</Tag>}
           {info?.user ? (
             <>
               <Tag color="blue">{info.user}</Tag>
@@ -59,21 +62,22 @@ export default function Shell() {
                   nav('/login', { replace: true });
                 }}
               >
-                退出
+                {t('shell.logout')}
               </Button>
             </>
           ) : (
             <>
               {info?.login && (
                 <Button size="small" type="primary" icon={<LoginOutlined />} onClick={() => nav('/login')}>
-                  账号登录
+                  {t('shell.login')}
                 </Button>
               )}
               <Button size="small" icon={<KeyOutlined />} onClick={() => setAskToken(true)}>
-                访问令牌
+                {t('shell.token')}
               </Button>
             </>
           )}
+          <LanguageSwitch dark />
         </Space>
       </Header>
       <Content style={{ padding: 24 }}>
@@ -81,9 +85,9 @@ export default function Shell() {
       </Content>
       <Modal
         open={askToken}
-        title="访问令牌"
-        okText="保存"
-        cancelText="取消"
+        title={t('shell.token')}
+        okText={t('action.save')}
+        cancelText={t('action.cancel')}
         onCancel={() => setAskToken(false)}
         onOk={() => {
           setToken(token.trim());
@@ -93,7 +97,7 @@ export default function Shell() {
         }}
       >
         <Typography.Paragraph type="secondary">
-          与 rdpgw 的 <code>-monitor-token</code> 一致；网关未设置令牌时留空。
+          <Trans i18nKey="shell.tokenHelp" components={{ code: <code /> }} />
         </Typography.Paragraph>
         <Input.Password value={token} onChange={(e) => setTokenValue(e.target.value)} placeholder="monitor token" />
       </Modal>

@@ -3,6 +3,7 @@ import { Alert, Button, Card, Descriptions, Segmented, Select, Slider, Space, Sp
 import { ArrowLeftOutlined, DownloadOutlined, PauseOutlined, CaretRightOutlined, FullscreenOutlined, MutedOutlined, SoundOutlined } from '@ant-design/icons';
 import { useNavigate, useParams } from 'react-router-dom';
 import dayjs from 'dayjs';
+import { useTranslation } from 'react-i18next';
 import { account, api, downloadURL, endLabels, fmtBytes, fmtDuration } from '../api';
 import { parseRecording, REC_END, REC_KEY, REC_RESIZE, Renderer, type Recording } from '../rdpv';
 import Screen, { type ScreenFit, type ScreenHandle } from '../components/Screen';
@@ -12,6 +13,7 @@ import { AudioPlayer, REC_AUDIO } from '../audio';
 const SPEEDS = [0.5, 1, 2, 4, 8];
 
 export default function Player() {
+  const { t } = useTranslation(['player', 'common']);
   const { id = '' } = useParams();
   const nav = useNavigate();
   const view = useRef<ScreenHandle>(null);
@@ -143,19 +145,19 @@ export default function Player() {
       title={
         <Space>
           <Button icon={<ArrowLeftOutlined />} onClick={() => nav('/recordings')}>
-            返回
+            {t('common:action.back')}
           </Button>
           <span>{meta ? `${account(meta)} → ${meta.target}` : id}</span>
-          {rec?.truncated && <Tag color="orange">文件被截断</Tag>}
+          {rec?.truncated && <Tag color="orange">{t('truncated')}</Tag>}
         </Space>
       }
       extra={
         <Space>
           <Button icon={<FullscreenOutlined />} onClick={() => void box.current?.requestFullscreen()}>
-            全屏
+            {t('fullscreen')}
           </Button>
           <Button icon={<DownloadOutlined />} href={downloadURL(id)}>
-            下载
+            {t('common:action.download')}
           </Button>
         </Space>
       }
@@ -195,9 +197,9 @@ export default function Player() {
           }}
           onChangeComplete={(v) => void seek(v)}
         />
-        <Segmented size="small" value={fit} onChange={v => setFit(v as ScreenFit)} options={[{ value: 'contain', label: '适应窗口' }, { value: 'actual', label: '原始大小' }]} />
+        <Segmented size="small" value={fit} onChange={v => setFit(v as ScreenFit)} options={[{ value: 'contain', label: t('fit.contain') }, { value: 'actual', label: t('fit.actual') }]} />
         {hasAudio && (
-          <Tooltip title={blocked ? '浏览器阻止了自动播放，点击页面任意处开启声音' : speed !== 1 ? '只在 1× 速度播放声音' : muted ? '取消静音' : '静音'}>
+          <Tooltip title={blocked ? t('sound.blocked') : speed !== 1 ? t('sound.speed') : muted ? t('sound.unmute') : t('sound.mute')}>
             <Button
               icon={muted || blocked || speed !== 1 ? <MutedOutlined /> : <SoundOutlined />}
               danger={blocked}
@@ -213,17 +215,17 @@ export default function Player() {
       </div>
       {meta && (
         <Descriptions size="small" column={{ xs: 1, sm: 2, md: 2, lg: 2, xl: 2, xxl: 3 }} style={{ marginTop: 16 }}>
-          <Descriptions.Item label="开始时间">{dayjs(meta.started).format('YYYY-MM-DD HH:mm:ss')}</Descriptions.Item>
-          <Descriptions.Item label="客户端">{meta.remote_addr}</Descriptions.Item>
-          <Descriptions.Item label="分辨率">{size[0] ? `${size[0]}×${size[1]}` : '-'}</Descriptions.Item>
-          <Descriptions.Item label="大小">{fmtBytes(meta.size)}</Descriptions.Item>
-          <Descriptions.Item label="结束">{endLabels[meta.end ?? ''] ?? meta.end ?? '-'}</Descriptions.Item>
-          <Descriptions.Item label="登录方式">{meta.login_form ? '网关登录表单' : '直连凭据'}</Descriptions.Item>
-          {meta.error && <Descriptions.Item label="错误">{meta.error}</Descriptions.Item>}
+          <Descriptions.Item label={t('meta.started')}>{dayjs(meta.started).format('YYYY-MM-DD HH:mm:ss')}</Descriptions.Item>
+          <Descriptions.Item label={t('meta.client')}>{meta.remote_addr}</Descriptions.Item>
+          <Descriptions.Item label={t('meta.resolution')}>{size[0] ? `${size[0]}×${size[1]}` : '-'}</Descriptions.Item>
+          <Descriptions.Item label={t('meta.size')}>{fmtBytes(meta.size)}</Descriptions.Item>
+          <Descriptions.Item label={t('meta.end')}>{endLabels[meta.end ?? ''] ?? meta.end ?? '-'}</Descriptions.Item>
+          <Descriptions.Item label={t('meta.login')}>{meta.login_form ? t('meta.loginForm') : t('meta.directCredentials')}</Descriptions.Item>
+          {meta.error && <Descriptions.Item label={t('meta.error')}>{meta.error}</Descriptions.Item>}
         </Descriptions>
       )}
         </div>
-        <aside className="monitor-aside" aria-label="录像操作时间轴">
+        <aside className="monitor-aside" aria-label={t('timelineAria')}>
         <Events
           sidebar
           events={events}
