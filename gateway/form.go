@@ -156,7 +156,7 @@ func (g *Gateway) dialForm(ctx context.Context, c *server.Conn, peer server.Peer
 	channels := newChannelMap(c, g.cfg.AllowChannel)
 	opts := transport.Options{
 		NLA: target.NLA, LegacyCredSSP: target.LegacyCredSSP, ServerName: target.ServerName, RootCAs: target.RootCAs, PinSHA256: target.PinSHA256, MinTLSVersion: target.MinTLS, Timeout: target.Timeout,
-		ClientName: peer.ClientName, DesktopWidth: peer.DesktopWidth, DesktopHeight: peer.DesktopHeight, ColorDepth: depth,
+		ClientName: targetClientName(peer.ClientName), DesktopWidth: peer.DesktopWidth, DesktopHeight: peer.DesktopHeight, ColorDepth: depth,
 		Channels: channels.defs,
 		Domain:   vals.Domain, UserName: vals.UserName, Password: vals.Password,
 	}

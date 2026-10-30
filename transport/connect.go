@@ -144,23 +144,27 @@ const (
 
 func basicSettingsExchange(conn net.Conn, opts Options, res *Result) error {
 	width, height := desktopSize(opts)
-	core, err := wire.ClientCoreData{
+	core := wire.ClientCoreData{
 		Version:                wire.RDPVersion5Plus,
 		DesktopWidth:           width,
 		DesktopHeight:          height,
 		ColorDepth:             wire.ColorDepth8bpp,
 		SASSequence:            wire.SASSequenceDel,
-		KeyboardLayout:         keyboardLayoutUS,
+		KeyboardLayout:         opts.keyboardLayout(),
 		ClientName:             clientName(opts),
 		KeyboardType:           wire.KeyboardTypeIBMEnhance,
 		KeyboardFunctionKey:    keyboardFunctionKey,
 		PostBeta2ColorDepth:    wire.ColorDepth8bpp,
 		ClientProductID:        1,
-		HighColorDepth:         opts.colorDepth(),
+		HighColorDepth:         opts.highColorDepth(),
 		SupportedColorDepths:   wire.SupportColorDepths24 | wire.SupportColorDepths16 | wire.SupportColorDepths15 | wire.SupportColorDepths32,
 		EarlyCapabilityFlags:   wire.CapSupportErrInfoPDU,
 		ServerSelectedProtocol: res.SelectedProtocol,
-	}.Encode()
+	}
+	if opts.colorDepth() == 32 {
+		core.EarlyCapabilityFlags |= wire.CapWant32BPPSession
+	}
+	coreData, err := core.Encode()
 	if err != nil {
 		return err
 	}
@@ -174,7 +178,7 @@ func basicSettingsExchange(conn net.Conn, opts Options, res *Result) error {
 	if err != nil {
 		return err
 	}
-	blocks := append(append(core, security...), network...)
+	blocks := append(append(coreData, security...), network...)
 	gcc, err := wire.EncodeConferenceCreateRequest(blocks)
 	if err != nil {
 		return err

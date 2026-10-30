@@ -37,6 +37,7 @@ const (
 	SupportColorDepths15   uint16 = 0x0004
 	SupportColorDepths32   uint16 = 0x0008
 	CapSupportErrInfoPDU   uint16 = 0x0001
+	CapWant32BPPSession    uint16 = 0x0002
 	KeyboardTypeIBMEnhance uint32 = 0x00000004
 )
 

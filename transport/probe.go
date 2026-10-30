@@ -68,9 +68,19 @@ type Options struct {
 	// DesktopWidth/DesktopHeight are advertised in Client Core Data. Zero
 	// means 1024x768.
 	DesktopWidth, DesktopHeight uint16
-	// ColorDepth is the highColorDepth requested in Client Core Data and
-	// the preferred depth in Confirm Active: 15, 16 or 24 (0 means 24).
+	// ColorDepth is the session colour depth: 15, 16, 24 or 32 (0 means
+	// 24). 32 is requested as highColorDepth 24 plus
+	// RNS_UD_CS_WANT_32BPP_SESSION, as Windows expects.
 	ColorDepth uint16
+	// KeyboardLayout is the input locale identifier announced to the
+	// server (0 means 0x0409, US English).
+	KeyboardLayout uint32
+	// PerformanceFlags go in the Client Info PDU (wire.Perf*). Zero means
+	// wallpaper, full-window drag, menu animations and theming disabled.
+	PerformanceFlags uint32
+	// AutoReconnect is an ARC_CS_PRIVATE_PACKET (wire.ARCCookie.ClientPacket)
+	// sent in the Client Info PDU to rejoin a session after a lost connection.
+	AutoReconnect []byte
 	// Channels are the static virtual channels requested in Client Network
 	// Data (at most 31) and joined after the I/O channel. Dial exposes the
 	// allocated IDs via Session.StaticChannels in the same order. Empty
@@ -97,10 +107,33 @@ type Options struct {
 
 func (o Options) colorDepth() uint16 {
 	switch o.ColorDepth {
-	case 15, 16, 24:
+	case 15, 16, 24, 32:
 		return o.ColorDepth
 	}
 	return 24
+}
+
+// highColorDepth is the Client Core Data value: 32bpp is asked for with
+// an early capability flag on top of 24.
+func (o Options) highColorDepth() uint16 {
+	if d := o.colorDepth(); d != 32 {
+		return d
+	}
+	return 24
+}
+
+func (o Options) keyboardLayout() uint32 {
+	if o.KeyboardLayout == 0 {
+		return keyboardLayoutUS
+	}
+	return o.KeyboardLayout
+}
+
+func (o Options) performanceFlags() uint32 {
+	if o.PerformanceFlags == 0 {
+		return wire.PerfDisableWallpaper | wire.PerfDisableFullWindowDrag | wire.PerfDisableMenuAnimations | wire.PerfDisableTheming
+	}
+	return o.PerformanceFlags
 }
 
 // Stage names in the order they are reached.

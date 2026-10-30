@@ -25,17 +25,18 @@ const (
 
 // SaveSessionInfo is TS_SAVE_SESSION_INFO_PDU_DATA. UserName/Domain come
 // from the server's logon notification; the auto-reconnect cookie is only
-// flagged, never retained.
+// kept in AutoReconnect for a client that wants to rejoin the session.
 type SaveSessionInfo struct {
 	InfoType  uint32 `json:"info_type"`
 	SessionID uint32 `json:"session_id"`
 	Domain    string `json:"domain"`
 	UserName  string `json:"user_name"`
 
-	HasAutoReconnectCookie bool   `json:"has_auto_reconnect_cookie"`
-	HasLogonErrors         bool   `json:"has_logon_errors"`
-	ErrorNotificationType  uint32 `json:"error_notification_type"`
-	ErrorNotificationData  uint32 `json:"error_notification_data"`
+	HasAutoReconnectCookie bool       `json:"has_auto_reconnect_cookie"`
+	AutoReconnect          *ARCCookie `json:"-"`
+	HasLogonErrors         bool       `json:"has_logon_errors"`
+	ErrorNotificationType  uint32     `json:"error_notification_type"`
+	ErrorNotificationData  uint32     `json:"error_notification_data"`
 }
 
 func utf16zString(b []byte, max int) string {
@@ -116,6 +117,9 @@ func DecodeSaveSessionInfo(body []byte) (SaveSessionInfo, error) {
 			switch f {
 			case logonExAutoReconnectCookie:
 				s.HasAutoReconnectCookie = true
+				if c, err := decodeARCCookie(p[:n]); err == nil {
+					s.AutoReconnect = c
+				}
 			case logonExLogonErrors:
 				if n < 8 {
 					return s, fmt.Errorf("%w: logon errors info %d bytes", ErrShare, n)

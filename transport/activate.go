@@ -87,13 +87,13 @@ func sendClientInfo(conn net.Conn, opts Options, res *Result) error {
 	ci := wire.ClientInfo{
 		Flags: wire.InfoMouse | wire.InfoDisableCtrlAltDel | wire.InfoMaximizeShell |
 			wire.InfoLogonNotify | wire.InfoEnableWindowsKey | wire.InfoLogonErrors,
-		Domain:    opts.Domain,
-		UserName:  opts.UserName,
-		Password:  opts.Password,
-		ClientDir: clientName(opts),
-		TimeZone:  wire.UTCTimeZone,
-		PerformanceFlags: wire.PerfDisableWallpaper | wire.PerfDisableFullWindowDrag |
-			wire.PerfDisableMenuAnimations | wire.PerfDisableTheming,
+		Domain:           opts.Domain,
+		UserName:         opts.UserName,
+		Password:         opts.Password,
+		ClientDir:        clientName(opts),
+		TimeZone:         wire.UTCTimeZone,
+		PerformanceFlags: opts.performanceFlags(),
+		AutoReconnect:    opts.AutoReconnect,
 	}
 	if opts.Password != "" {
 		ci.Flags |= wire.InfoAutoLogon
@@ -177,7 +177,7 @@ func capabilityExchange(conn net.Conn, opts Options, res *Result) (wire.DemandAc
 		DesktopWidth:   width,
 		DesktopHeight:  height,
 		ColorDepth:     opts.colorDepth(),
-		KeyboardLayout: keyboardLayoutUS,
+		KeyboardLayout: opts.keyboardLayout(),
 		KeyboardType:   wire.KeyboardTypeIBMEnhance,
 		FunctionKeys:   keyboardFunctionKey,
 	})

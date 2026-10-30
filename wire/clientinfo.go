@@ -135,6 +135,7 @@ type ClientInfo struct {
 	TimeZone            TimeZoneInformation
 	SessionID           uint32
 	PerformanceFlags    uint32
+	AutoReconnect       []byte // ARC_CS_PRIVATE_PACKET, see ARCCookie.ClientPacket
 }
 
 // Encode produces the TS_INFO_PACKET bytes (without security header).
@@ -209,7 +210,11 @@ func (ci ClientInfo) Encode() ([]byte, error) {
 	out = append(out, tz...)
 	out = binary.LittleEndian.AppendUint32(out, ci.SessionID)
 	out = binary.LittleEndian.AppendUint32(out, ci.PerformanceFlags)
-	out = binary.LittleEndian.AppendUint16(out, 0) // cbAutoReconnectCookie
+	if len(ci.AutoReconnect) > 128 {
+		return nil, fmt.Errorf("%w: auto-reconnect cookie too long", ErrClientInfo)
+	}
+	out = binary.LittleEndian.AppendUint16(out, uint16(len(ci.AutoReconnect)))
+	out = append(out, ci.AutoReconnect...)
 	out = binary.LittleEndian.AppendUint16(out, 0) // reserved1
 	out = binary.LittleEndian.AppendUint16(out, 0) // reserved2
 	return out, nil

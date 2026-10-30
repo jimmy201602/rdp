@@ -24,6 +24,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"rdp.local/kernel/server"
@@ -88,6 +89,17 @@ type Config struct {
 	OnSession func(s server.Summary)
 	// OnRelay reports every relayed session (after the target was dialed).
 	OnRelay func(r Summary)
+	// Observe, when set, is called as a relay starts; the Observer gets a
+	// copy of the target's output and of the client's input and may inject
+	// input and end the session (monitoring, recording, collaboration).
+	// Drawing orders are then switched off in the Confirm Active sent to the
+	// target so that the screen is drawn with bitmap updates only.
+	Observe func(s ObserveSession) Observer
+	// DriveControl lets the Observer send its own device I/O requests to the
+	// client's redirected drives (ObserveSession.DriveRequest). rdpdr traffic
+	// is then reassembled and completion ids are remapped so injected
+	// requests never collide with the target's.
+	DriveControl bool
 }
 
 // Summary describes one relayed session.
@@ -110,6 +122,7 @@ type Summary struct {
 	Reactivations       int
 	LoginForm           bool   // target and credentials came from the logon form
 	FormAttempts        int    // connection attempts made from the form (1 = first try)
+	InjectedInput       int    // input events injected through Config.Observe
 	End                 string // "client-closed", "target-closed", "canceled", "error"
 	Err                 error
 	Duration            time.Duration
@@ -212,7 +225,7 @@ func (g *Gateway) handle(ctx context.Context, c *server.Conn) error {
 	creds := c.Credentials()
 	opts := transport.Options{
 		NLA: target.NLA, LegacyCredSSP: target.LegacyCredSSP, ServerName: target.ServerName, RootCAs: target.RootCAs, PinSHA256: target.PinSHA256, MinTLSVersion: target.MinTLS, Timeout: target.Timeout,
-		ClientName: peer.ClientName, DesktopWidth: peer.DesktopWidth, DesktopHeight: peer.DesktopHeight, ColorDepth: depth,
+		ClientName: targetClientName(peer.ClientName), DesktopWidth: peer.DesktopWidth, DesktopHeight: peer.DesktopHeight, ColorDepth: depth,
 		Channels: channels.defs,
 		Domain:   creds.Domain, UserName: creds.UserName, Password: creds.Password,
 	}
@@ -293,6 +306,15 @@ type relay struct {
 	firstServer *transport.PDU
 	mu          sync.Mutex
 	sum         Summary
+	obs         Observer
+	wmu         sync.Mutex // serializes writes to the target (relay, injected input)
+	shareID     uint32     // guarded by mu
+	active      bool       // guarded by mu: Confirm Active relayed, input may be injected
+	kicked      atomic.Bool
+	cwmu        sync.Mutex // serializes writes to the client
+	cliReasm    map[string]*wire.ChannelReassembler
+	srvReasm    map[string]*wire.ChannelReassembler
+	drive       *driveMux
 }
 
 type relayEnd struct {
@@ -309,6 +331,16 @@ func (r *relay) run(ctx context.Context) error {
 		_ = r.client.Close()
 	})
 	defer stop()
+	r.initChannels()
+	if r.g.cfg.Observe != nil {
+		r.obs = r.g.cfg.Observe(ObserveSession{
+			RemoteAddr: fmt.Sprint(r.sum.RemoteAddr), UserName: r.sum.UserName, Domain: r.sum.Domain, ClientName: r.sum.ClientName,
+			Target: r.sum.Target, LoginForm: r.sum.LoginForm,
+			Disconnect:   func() { r.kicked.Store(true); cancel() },
+			Inject:       r.inject,
+			DriveRequest: r.driveRequest,
+		})
+	}
 	results := make(chan relayEnd, 2)
 	go func() { results <- r.clientToTarget() }()
 	go func() { results <- r.targetToClient() }()
@@ -322,17 +354,26 @@ func (r *relay) run(ctx context.Context) error {
 	}
 	cancel()
 	<-results
+	if r.drive != nil {
+		r.drive.close()
+	}
 	r.mu.Lock()
 	r.sum.Duration = time.Since(start)
 	r.sum.End, r.sum.Err = first.end, first.err
 	if parentDone {
 		r.sum.End, r.sum.Err = "canceled", nil
 	}
+	if r.kicked.Load() {
+		r.sum.End, r.sum.Err = "monitor-disconnect", nil
+	}
 	sum := r.sum
 	r.mu.Unlock()
 	r.g.cfg.Logf("%s: relay to %s ended (%s): client %d pdus + %d fast-path, target %d pdus + %d fast-path, input %v, dropped caps %v, channels %v, dropped channels %v, reactivations %d",
 		sum.RemoteAddr, sum.Target, sum.End, sum.ClientPDUs, sum.ClientFastPath, sum.ServerPDUs, sum.ServerFastPath,
 		sum.InputEvents, sum.DroppedCapabilities, sum.ChannelPDUs, sum.DroppedChannels, sum.Reactivations)
+	if r.obs != nil {
+		r.obs.Close(sum.End, sum.Err)
+	}
 	if r.g.cfg.OnRelay != nil {
 		r.g.cfg.OnRelay(sum)
 	}
@@ -377,10 +418,13 @@ func (r *relay) clientToTarget() relayEnd {
 				continue
 			}
 			r.countInput(events)
+			if r.obs != nil {
+				r.obs.ClientInput(events)
+			}
 			r.mu.Lock()
 			r.sum.ClientFastPath++
 			r.mu.Unlock()
-			if err := r.backend.WriteFastPath(pdu.Data); err != nil {
+			if err := r.writeTarget(func() error { return r.backend.WriteFastPath(pdu.Data) }); err != nil {
 				return relayEnd{end: "target-closed"}
 			}
 			continue
@@ -398,7 +442,14 @@ func (r *relay) clientToTarget() relayEnd {
 			if !ok {
 				continue
 			}
-			if err := r.backend.WriteChannel(back, pdu.Data); err != nil {
+			handled, err := r.relayChannel(true, name, pdu.Data)
+			if err != nil {
+				return relayEnd{end: "error", err: err}
+			}
+			if handled {
+				continue
+			}
+			if err := r.writeTarget(func() error { return r.backend.WriteChannel(back, pdu.Data) }); err != nil {
 				return relayEnd{end: "target-closed"}
 			}
 			continue
@@ -413,7 +464,7 @@ func (r *relay) clientToTarget() relayEnd {
 		r.mu.Lock()
 		r.sum.ClientPDUs++
 		r.mu.Unlock()
-		if err := r.backend.WriteIO(out); err != nil {
+		if err := r.writeTarget(func() error { return r.backend.WriteIO(out) }); err != nil {
 			return relayEnd{end: "target-closed"}
 		}
 	}
@@ -435,7 +486,13 @@ func (r *relay) rewriteClientPDU(data []byte) ([]byte, error) {
 			return nil, fmt.Errorf("%w: confirm active: %v", ErrRelay, err)
 		}
 		caps := r.filterCaps(ca.Capabilities)
+		if r.obs != nil {
+			caps = withoutOrders(caps)
+		}
 		r.dropInput = false
+		r.mu.Lock()
+		r.shareID, r.active = ca.ShareID, true
+		r.mu.Unlock()
 		return wire.EncodeConfirmActive(ca.ShareID, r.backend.UserChannel(), strings.TrimRight(string(ca.SourceDescriptor), "\x00"), caps)
 	case wire.PDUTypeData:
 		sh, body, err := wire.DecodeShareData(data)
@@ -451,6 +508,9 @@ func (r *relay) rewriteClientPDU(data []byte) ([]byte, error) {
 				return nil, fmt.Errorf("%w: %v", ErrRelay, err)
 			}
 			r.countInput(events)
+			if r.obs != nil {
+				r.obs.ClientInput(events)
+			}
 		}
 	}
 	out := append([]byte(nil), data...)
@@ -482,8 +542,11 @@ func (r *relay) targetToClient() relayEnd {
 			r.mu.Lock()
 			r.sum.ServerFastPath++
 			r.mu.Unlock()
-			if err := r.client.WriteFastPath(pdu.Data); err != nil {
+			if err := r.writeClient(func() error { return r.client.WriteFastPath(pdu.Data) }); err != nil {
 				return relayEnd{end: "client-closed"}
+			}
+			if r.obs != nil {
+				r.obs.ServerPDU(true, pdu.Data)
 			}
 			continue
 		}
@@ -495,7 +558,14 @@ func (r *relay) targetToClient() relayEnd {
 			r.mu.Lock()
 			r.sum.ChannelPDUs[r.channels.backToName[pdu.Channel]]++
 			r.mu.Unlock()
-			if err := r.client.WriteChannel(front, pdu.Data); err != nil {
+			handled, err := r.relayChannel(false, r.channels.backToName[pdu.Channel], pdu.Data)
+			if err != nil {
+				return relayEnd{end: "error", err: err}
+			}
+			if handled {
+				continue
+			}
+			if err := r.writeClient(func() error { return r.client.WriteChannel(front, pdu.Data) }); err != nil {
 				return relayEnd{end: "client-closed"}
 			}
 			continue
@@ -507,8 +577,11 @@ func (r *relay) targetToClient() relayEnd {
 		r.mu.Lock()
 		r.sum.ServerPDUs++
 		r.mu.Unlock()
-		if err := r.client.WriteIO(out); err != nil {
+		if err := r.writeClient(func() error { return r.client.WriteIO(out) }); err != nil {
 			return relayEnd{end: "client-closed"}
+		}
+		if r.obs != nil {
+			r.obs.ServerPDU(false, pdu.Data)
 		}
 	}
 }
@@ -532,6 +605,7 @@ func (r *relay) rewriteServerPDU(data []byte) ([]byte, error) {
 	case wire.PDUTypeDeactivateAll:
 		r.mu.Lock()
 		r.sum.Reactivations++
+		r.active = false
 		r.mu.Unlock()
 	}
 	return data, nil
@@ -541,6 +615,10 @@ func (r *relay) filterCaps(sets []wire.CapabilitySet) []wire.CapabilitySet {
 	kept := make([]wire.CapabilitySet, 0, len(sets))
 	for _, s := range sets {
 		if r.g.cfg.AllowCapability(s.Type) {
+			if r.g.cfg.DriveControl && s.Type == wire.CapsTypeVirtualChannel && len(s.Data) >= 4 {
+				s.Data = append([]byte(nil), s.Data...)
+				clear(s.Data[:4]) // no virtual-channel compression in either direction
+			}
 			kept = append(kept, s)
 			continue
 		}
@@ -557,4 +635,105 @@ func (r *relay) countInput(events []wire.InputEvent) {
 		r.sum.InputEvents[e.Kind.String()]++
 	}
 	r.mu.Unlock()
+}
+
+// Observer watches one relay; see Config.Observe. Its methods are called
+// from the relay goroutines and must not block for long.
+type Observer interface {
+	// ServerPDU gets target output after it was forwarded: a fast-path
+	// frame or an I/O channel share control PDU as the target sent it.
+	ServerPDU(fastPath bool, data []byte)
+	// ClientInput gets the client's input events (codes are keystrokes).
+	ClientInput(events []wire.InputEvent)
+	// Close is called once the relay has ended.
+	Close(end string, err error)
+}
+
+// ObserveSession describes a relay to Config.Observe.
+type ObserveSession struct {
+	RemoteAddr, UserName, Domain, ClientName, Target string
+	LoginForm                                        bool
+	// Web marks a browser-initiated session (Gateway.ConnectWeb): there is
+	// no front-end RDP client and the Observer's viewer is the user.
+	Web bool
+	// Disconnect ends the relay (Summary.End "monitor-disconnect").
+	Disconnect func()
+	// Inject sends input events (slow-path flag words) to the target as
+	// if the client had sent them.
+	Inject func(events []wire.InputEvent) error
+	// DriveRequest sends a device I/O request (wire.Encode*) to the client's
+	// redirected drives and waits for its completion. It fails unless
+	// Config.DriveControl is set and the client redirects devices.
+	DriveRequest func(ctx context.Context, req []byte) (wire.IOCompletion, error)
+	// Web sessions only. Clipboard offers browser clipboard content to the
+	// remote desktop; what is copied there reaches a ClipboardObserver. MapDrive
+	// shares a browser folder as a redirected drive (replacing a previous
+	// one) and UnmapDrive withdraws it.
+	Clipboard  func(c ClipContent) error
+	MapDrive   func(name string, fs WebFS) error
+	UnmapDrive func() error
+	// Resize asks the target to change the desktop size (MS-RDPEDISP);
+	// ErrNoDisplayControl until the target opened display control. A
+	// DisplayObserver learns when that happens.
+	Resize func(w, h int) error
+}
+
+// DisplayObserver is told when a web session's target can (or no longer
+// can) resize the running desktop.
+type DisplayObserver interface {
+	DisplayControl(ready bool)
+}
+
+func (r *relay) driveRequest(ctx context.Context, req []byte) (wire.IOCompletion, error) {
+	if r.drive == nil {
+		return wire.IOCompletion{}, fmt.Errorf("%w: drive control disabled or no rdpdr channel", ErrRelay)
+	}
+	return r.drive.request(ctx, req)
+}
+
+func (r *relay) writeTarget(write func() error) error {
+	r.wmu.Lock()
+	defer r.wmu.Unlock()
+	return write()
+}
+
+// inject sends observer input to the target as a slow-path Input PDU.
+func (r *relay) inject(events []wire.InputEvent) error {
+	r.mu.Lock()
+	shareID, active := r.shareID, r.active
+	r.mu.Unlock()
+	if !active {
+		return fmt.Errorf("%w: target not active, input not injected", ErrRelay)
+	}
+	body, err := wire.EncodeInputPDU(events)
+	if err != nil {
+		return err
+	}
+	pdu, err := wire.EncodeShareData(shareID, r.backend.UserChannel(), wire.PDUType2Input, body)
+	if err != nil {
+		return err
+	}
+	if err := r.writeTarget(func() error { return r.backend.WriteIO(pdu) }); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.sum.InjectedInput += len(events)
+	r.mu.Unlock()
+	return nil
+}
+
+// withoutOrders clears orderSupport (TS_ORDER_CAPABILITYSET bytes 32-63 of
+// the capability data) so that the target only sends bitmap updates, which
+// an Observer can render.
+func withoutOrders(sets []wire.CapabilitySet) []wire.CapabilitySet {
+	out := make([]wire.CapabilitySet, len(sets))
+	for i, s := range sets {
+		if s.Type == wire.CapsTypeOrder && len(s.Data) >= 64 {
+			d := append([]byte(nil), s.Data...)
+			clear(d[32:64])
+			s.Data = d
+		}
+		out[i] = s
+	}
+	return out
 }

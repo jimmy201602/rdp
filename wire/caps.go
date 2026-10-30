@@ -363,7 +363,7 @@ func DefaultClientCapabilities(o ClientCapabilityOptions) []CapabilitySet {
 		GeneralCapability{
 			OSMajorType: OSMajorTypeUnix,
 			OSMinorType: OSMinorTypeUnspecified,
-			ExtraFlags:  GeneralLongCredentialsSupported | GeneralNoBitmapCompressionHdr | GeneralFastPathOutputSupported,
+			ExtraFlags:  GeneralLongCredentialsSupported | GeneralNoBitmapCompressionHdr | GeneralFastPathOutputSupported | GeneralAutoReconnectSupported,
 		}.Set(),
 		BitmapCapability{
 			PreferredBitsPerPixel:    o.ColorDepth,
@@ -380,7 +380,7 @@ func DefaultClientCapabilities(o ClientCapabilityOptions) []CapabilitySet {
 		PointerCapability{ColorPointerFlag: 1, ColorPointerCacheSize: DefaultPointerCacheSize, PointerCacheSize: DefaultPointerCacheSize}.Set(),
 		ShareCapability{}.Set(),
 		InputCapability{
-			InputFlags:          InputFlagScancodes | InputFlagUnicode,
+			InputFlags:          InputFlagScancodes | InputFlagUnicode | InputFlagMouseX | InputFlagMouseHWheel,
 			KeyboardLayout:      o.KeyboardLayout,
 			KeyboardType:        o.KeyboardType,
 			KeyboardFunctionKey: o.FunctionKeys,

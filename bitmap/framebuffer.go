@@ -127,7 +127,7 @@ func (f *Framebuffer) Draw(b wire.BitmapData) error {
 	pix := b.Data()
 	if b.Compressed {
 		var err error
-		if pix, err = Decompress(pix, w, h, bpp); err != nil {
+		if pix, err = decompress(pix, w, h, bpp); err != nil {
 			return f.reject(fmt.Errorf("%w: %dx%dx%d at (%d,%d): %w", ErrDraw, w, h, bpp, b.DestLeft, b.DestTop, err))
 		}
 		f.stats.Decompressed++

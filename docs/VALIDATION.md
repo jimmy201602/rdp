@@ -283,3 +283,36 @@ VM 真实链路：Ubuntu 22.04 + Xvfb :99，xfreerdp 2.6.1 → `rdpgw 127.0.0.1:
 - 服务端角色：只对 xfreerdp 2.6.1（TLS）和 3.31（NLA，经网关）验证，mstsc/Windows 客户端、多显示器、Auto-Reconnect、Shutdown Request 真实路径、空闲超时、并发上限（只有单元/手工路径）未在真实客户端上验证；重激活只以“网关表单 → Deactivate All → 目标 Demand Active”这一种形态在 xfreerdp 3.31 上验证；位图只发未压缩矩形，没有压缩编码、fast-path 输出、orders（Demand Active 里声明它们只是为了保住后续目标的协商）。
 - 登录表单：只有中文提示、无 IME；表单画面不经压缩；`-allow-target` 只按地址做策略，没有按用户/时间的规则；`-target-credssp-legacy` 放弃 CredSSP 5/6 的 nonce 公钥绑定（CVE-2018-0886），只在配合 `-target-pin` 时才有意义，且 RC4 回退让 Win7 会话全程使用 RC4——这两项都是对 EOL 主机的兼容，不是推荐配置。
 - 证书验证关闭或降级路径：不存在该选项，也不计划提供。
+
+## 网页客户端：剪贴板、浏览器文件夹映射、断线重连（2026-10-30）
+
+链路：无头驱动 `.build/webe2e`（扮演浏览器：登录 → `/api/connect` → 所有者 WebSocket，文件请求由本地临时目录应答）→ 本机 `rdpgw -login-form -web-users … -target-nla -target-min-tls 1.0 -target-pin …` → 192.0.2.20 Server 2016。
+
+| 项目 | 结果 |
+| --- | --- |
+| 通道 | 网页会话申请 `rdpdr`、`rdpsnd`、`cliprdr`（目标分配 1004/1005/1006）。只申请 cliprdr+rdpdr 时 Windows 不发 rdpdr Server Announce，必须同时有 rdpsnd；cliprdr 块不带 `CHANNEL_FLAG_SHOW_PROTOCOL` 时 Windows 不响应 |
+| 远程 → 浏览器剪贴板 | 远程 `echo remote-clip-ok\| clip` → 浏览器收到 `{"t":"clip","text":"remote-clip-ok"}` |
+| 浏览器 → 远程剪贴板 | 发送 `from-browser-剪贴板` → 远程 `Get-Clipboard` 写回映射盘，内容一致 |
+| 映射文件夹 | `\\tsclient\E2E` 可见；`dir`、`type`（读本地文件）、`mkdir`、重定向写文件、`ren`、`del`、`copy explorer.exe`（4,673,928 字节）均正确 |
+| 断线重连 | 关闭 WebSocket 5 秒后用同一 owner key 重连，hello 返回 `owner=true drive="E2E"`，会话未断 |
+
+修复：FILE_FS_VOLUME_INFORMATION 在 RDP 中不含末尾 Reserved 字节（17 字节 + 卷标），多 1 字节时 Windows 不再继续发 I/O 请求。
+
+未测：真实 Chrome/Edge 中的 File System Access API 与剪贴板权限弹窗（只做了 TypeScript 构建检查）、Windows 7 目标、`-monitor-autocert` 生成的证书在浏览器中的表现。
+
+## 网页客户端：音频、画面、动态通道、远端重连、富剪贴板、安全（2026-10-30）
+
+同一无头驱动，目标 192.0.2.20 Server 2016（NLA）与 192.0.2.10 Windows 7（TLS 1.0，无 NLA）。
+
+| 项目 | 2016 | Win7 |
+| --- | --- | --- |
+| 音频（rdpsnd，PCM 44.1 kHz 立体声 16 位转发浏览器） | 静态通道与 `AUDIO_PLAYBACK_DVC` 均收到 PCM | 静态通道收到 PCM |
+| 动态通道 drdynvc + 显示控制（MS-RDPEDISP） | 1280×800 → 1600×900 → 1366×768 画面正确 | 无显示控制（系统不支持，保持初始分辨率） |
+| 远端断线重连（`RDPGW_DEBUG_DROP_TARGET` 人为断开目标 TCP） | 1 秒内重连，带 auto-reconnect cookie；重连后可打开记事本 | 1 秒内重连（服务器未下发 cookie，凭据自动登录回原会话） |
+| 浏览器 → 远程：文本 + HTML + PNG | 远程读到 30×20 图片且 `GetText('Html')` 含片段 | 同左 |
+| 远程 → 浏览器：图片 | 远程 `SetImage` 50×40 → 浏览器收到 PNG | 同左（Win7 发 16 位 BI_BITFIELDS 5-6-5 DIB，已支持） |
+| 原有剪贴板 / 映射盘 / WebSocket 重连回归 | 通过 | 通过（Win7 PowerShell 2.0 无 `Get-Clipboard`，该步骤由驱动脚本限制无法检查） |
+
+画面（多脏矩形、大区域 JPEG + 静止后无损补发、40 ms 帧间隔）、安全（令牌换 HttpOnly Cookie、不再接受 `?token=`、`-monitor-origins`、HTTPS 页面提示、HSTS）有单元测试；`go test -race ./...` 全部通过。
+
+未测：真实浏览器中的 Web Audio 解锁、键盘锁定、IME、触控手势、`navigator.clipboard.read/write` 权限（只做了 TypeScript 构建检查）；真实网络抖动（只模拟了目标 TCP 被关闭）。
