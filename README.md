@@ -1,27 +1,74 @@
-# 独立 Go RDP 内核
+# RDP
 
-本目录是独立 Go module，不导入父项目的 GPL 包。它是闭源迁移的分阶段实现，不是已经完成的完整 RDP 客户端、服务端或网关。
+用 Go 标准库实现的 RDP（远程桌面协议）内核与网关：不依赖 CGO 和第三方协议库，从 TPKT/X.224、MCS、GCC、许可、能力协商一路实现到画面解码与输入转发，并在此基础上提供可直接使用的命令行工具和带 Web 界面的网关。
 
-G3-6（网关登录表单）：`rdpgw -login-form` 不再要求固定 `-target`，前端客户端走完 Client Info / 许可后先被网关自己激活（`server.Conn.Activate/SendBitmap/SendPointer/DecodeInput/DeactivateAll`，仅未压缩位图），看到 `form` 包绘制的登录表单（标准库之外无依赖的点阵字体，字段：服务器地址、用户名、密码、域；Tab/Shift+Tab 切换、Enter 提交、Esc 断开、鼠标点选，支持 Unicode 与扫描码输入），提交后由 `FormConfig.Route(ctx, Peer, address)` 决定是否允许该地址（`-allow-target` 主机/IP/CIDR 列表，`-target-pin host=sha256,…` 按主机固定证书，`-target-nla`/`-target-min-tls`/`-target-ca`/`-target-name`/`-target-timeout` 对所有目标生效），凭据只用于一次 `transport.Dial`，失败则把原因分类成中文提示（凭据错误、拒绝/不可达/解析失败/超时、证书不符、策略拒绝、协商失败、目标断开）保留表单重试，`-form-attempts` 次后回 DENIED 断开，`-form-idle` 空闲断开；密码为空时不计一次尝试、不联目标。目标通过许可后网关对前端发 Deactivate All，把目标的第一份 Demand Active 经能力白名单转发，前端 Confirm Active / 终结 PDU 改写 pduSource 后到目标，随后进入与 G3-3 相同的 relay（Deactivate All 之后、Confirm Active 之前到达的前端输入被丢弃）。两个真机教训已固化为代码和单测：① FreeRDP 客户端把每份 Demand Active 的可选能力按“与”合并且不再打开（fast-path 输出、32 个 order、refreshRect/suppressOutput、drawingFlags、横向滚轮、指针缓存取 min），所以网关表单那份 Demand Active 声明全集（`server/session.go serverCapabilities`，`TestServerCapabilitiesKeepRelayFeaturesNegotiable`），否则切到 Windows 后没有画面；② Windows 7 / 2008 R2 的 CredSSP 读到 Go 对 TLS 1.0 CBC 固定做的 1/n-1 记录拆分就回 TLS internal_error，`transport` 在 NLA 且协商出 TLS 1.0 CBC 时自动用 RC4 套件重连（`Result.TLS10StreamCipher`，`TestTLS10CredSSPRetriesWithStreamCipher`），未打 CVE-2018-0886 补丁的 Win7 只会 CredSSP v2，需显式 `-target-credssp-legacy`（`nla.ClientConfig.MinVersion`，公钥不经 nonce 绑定，只建议配合 `-target-pin`；`TestClientLegacyCredSSP`）。真机结果见 `docs/VALIDATION.md` 5.11。
+## 功能
 
-G3-5（前端 NLA：CredSSP 服务端 + `nla` 包）：CredSSP/NTLM 从 `transport` 抽成独立的 `nla` 包，导出 `Client`（原后端逻辑）和 `Server`：服务端对 NEGOTIATE 回 CHALLENGE（随机 8 字节、TargetInfo 含域/机器名/时间戳、只接受 Unicode+NTLMv2 ESS+签名封装+128 位+密钥交换），校验 AUTHENTICATE 的 NTLMv2 proof（密码由 `Lookup(user, domain)` 回调给出，未知用户也做同样计算后拒绝）、MIC（MsvAvFlags 声明时必须正确）、MsvAvChannelBindings（客户端给出非零绑定时必须等于本端 tls-server-end-point）、解出会话密钥，再校验客户端的 SHA-256 公钥绑定 nonce 证明、回服务端方向证明、解封 TSCredentials（只收 TSPasswordCreds，且委派的用户/密码必须与通过 NTLM 的身份一致，空委派视为无凭据）；失败时按 MS-CSSP 回 errorCode STATUS_LOGON_FAILURE 后断开，只接受 CredSSP 5/6（无 nonce 的旧版本拒绝）。除 FreeRDP 的裸 NTLMSSP 令牌外也接受 mstsc 的 SPNEGO 包装（NegTokenInit/NegTokenResp、只选 NTLM、首选机制不是 NTLM 时 request-mic、mechListMIC 双向签名并按 Windows 行为在 MIC 交换后重置 RC4 流），Kerberos 不实现。`server.Config.NLA`（查询回调）让前端在客户端请求 PROTOCOL_HYBRID 时选 HYBRID 并在 TLS 之后、MCS 之前跑 CredSSP（`RequireNLA` 则拒绝只提供 SSL 的客户端，回 HYBRID_REQUIRED_BY_SERVER），SC_CORE 回显客户端实际的 requestedProtocols，通过 NLA 的身份覆盖 Client Info 中未经认证的用户名/域、委派的密码作为透传给 `Authorize`/网关后端的凭据（`Peer.NLA`、`Summary.NLA` 标记）；证书公钥通过包装 `GetCertificate` 取实际下发的那张。`gateway.Config.NLA/RequireNLA` 与 `rdpgw -nla-users 文件`（每行 `user:password`）/`-require-nla` 对应。本机 xfreerdp 3.31 `/sec:nla` 和默认协商都经 rdpgw 的 NLA 前端（credssp v6）到 Windows 7 / Server 2016 得到桌面，错误口令在 MCS 之前被拒（见 `docs/VALIDATION.md` 5.10）。mstsc 的 SPNEGO 路径只有单测（按 FreeRDP 3.31 acceptor 行为建模），未对真实 mstsc 实测；不做 HYBRID_EX / Early User Auth、智能卡凭据、Kerberos。
+- **RDP 网关 `rdpgw`**：RDP 客户端（mstsc、xfreerdp 等）或浏览器经网关接入内网 Windows 主机
+  - 固定目标模式（`-target`）或登录表单模式（`-login-form`）：客户端先看到网关绘制的登录表单，填写目标地址和凭据后再连接
+  - 目标侧支持 NLA/CredSSP（NTLMv2）、证书指纹固定（`-target-pin`）、TLS 版本下限、按主机/IP/CIDR 的目标白名单
+  - 前端可要求客户端先过 NLA（`-nla-users`，含 mstsc 的 SPNEGO 包装）
+  - 静态虚拟通道透传：剪贴板、驱动器重定向、声音、drdynvc（`-allow-channel` 可控）
+  - 兼容 Windows 7 / Server 2008 R2：`-target-min-tls 1.0`、TLS 1.0 下 CredSSP 自动改用 RC4 套件、`-target-credssp-legacy`
+- **Web 界面与浏览器 RDP 客户端**（`-monitor` + `-web-users`）
+  - 浏览器直接发起 RDP 会话：动态分辨率、音频、富文本/图片剪贴板、把本地文件夹映射为目标磁盘、触控、Ctrl+Alt+Del 等快捷键
+  - 实时监控在途会话画面，可接管键鼠协同操作；监控端可浏览用户映射的磁盘
+  - 会话录像（`.rdpv`，含音频）与回放
+  - 中英文界面，默认跟随浏览器语言
+  - 目标断线自动重连（ARC cookie），浏览器断开后会话保留一段时间可恢复
+- **服务端角色 `rdpserve`**：最小 RDP 服务端（策略回调授权、推送测试画面），用于联调
+- **协议探针 `rdpprobe`**：分阶段探测目标（TLS / MCS / 许可 / 能力 / 激活），可导出画面和光标 PNG，支持 NLA
+- **监控 API 安全**：token 换 HttpOnly Cookie、来源校验、非回环监听强制 HTTPS（自带证书或自签）
 
-G3-4（静态虚拟通道透传 + 后端 NLA）：网关把客户端在 CS_NET 请求的静态通道（cliprdr/rdpdr/rdpsnd/drdynvc 等）按 `AllowChannel` 策略（`rdpgw -allow-channel`，默认全部）向目标同名请求并加入，前后端通道号按顺序映射，通道块（含 CHANNEL_PDU_HEADER）两向原样转发、按通道名计数，被策略拒绝的通道数据丢弃并计数；`transport.Options.NLA` / `gateway.Target.NLA` / `rdpgw -target-nla` 让后端请求 PROTOCOL_HYBRID 并用标准库实现 CredSSP 6（TSRequest DER、NTLMv2 + MIC + MsvAvChannelBindings/TERMSRV SPN、RC4 签名封装、SHA-256 公钥绑定 nonce 校验、TSPasswordCreds 委派），凭据沿用前端 Client Info 透传的那一份，前端仍 TLS-only；`-target-pin`（叶证书 SHA-256）和 `-target-min-tls 1.0` 用于自签名 / 仅 TLS 1.0 的 Windows 主机。本机 xfreerdp 3.31 经 rdpgw 到 Windows 7（TLS 1.0，无 NLA）和 Windows Server 2016（NLA）均得到完整桌面，剪贴板双向粘贴和 `\\tsclient` 驱动器重定向经网关可用（见 `docs/VALIDATION.md` 5.9）。动态通道只作为 drdynvc 静态通道原样透传、不解析；不做 CredSSP 服务端、Kerberos、智能卡、HYBRID_EX/Early User Auth。
+## 快速开始
 
-G3-3（网关最小链路，含 G3-2 最小输入转发）：`gateway` 包把 `server`（前端，TLS-only）和 `transport.Dial`（后端，TLS 或 NLA、严格校验目标证书）拼成 RDP 网关：前端走完 Client Info / 许可后由 `Route(ctx, Peer)` 策略决定目标或拒绝（拒绝回 ERRINFO_SERVER_DENIED_CONNECTION），用户名/域/密码只向目标的 Client Info 透传一次（不记日志、不进 Summary，Handler 返回后清零），目标握手失败同样以 DENIED 告知客户端；激活阶段对目标的 Demand Active 和客户端的 Confirm Active 按能力白名单过滤（默认丢 Surface Commands、Bitmap Codecs、Frame Ack、RAIL/Window/NineGrid/GDI+/CompDesk，xfreerdp 因而只用 orders + 位图），Share Control PDU 的 pduSource 改写为目标分配的用户通道，慢路径 I/O 与 fast-path 两向原样转发，输入（慢路径 Input PDU / fast-path）解码后只按类别计数；任一侧结束向另一侧发 Disconnect Provider Ultimatum 并清理。`cmd/rdpgw` 是对应 CLI。VM 上 xfreerdp 2.6.1 经 `rdpgw` 到 xrdp 0.9.24 得到完整 xfce 桌面并可点菜单、开终端、键入命令（见 `docs/VALIDATION.md` 5.8）。无 RemoteFX/GFX、RemoteApp。
+```sh
+# 构建（纯 Go，CGO_ENABLED=0）
+go build -o bin/rdpgw ./cmd/rdpgw
 
-G3-1（服务端角色最小链路）：`server` 包实现 TLS-only 的 RDP 服务端：X.224 协商只接受含 PROTOCOL_SSL 的请求（否则回 RDP_NEG_FAILURE SSL_REQUIRED_BY_SERVER）、Go 标准库 TLS 服务端握手（证书由调用方提供）、MCS Connect-Initial/Response（SC_CORE 回显 PROTOCOL_SSL、SC_SECURITY ENCRYPTION_NONE、SC_NET 按客户端请求分配静态通道号）、Erect Domain / Attach User / Channel Join、解码 Client Info 后把用户名/域/密码交给调用方的 `Authorize` 策略回调（密码只在回调期间可见，不记日志、不落 Summary；拒绝时先完成许可，再发 Set Error Info ERRINFO_SERVER_DENIED_CONNECTION 和 Disconnect Provider Ultimatum）、许可以 STATUS_VALID_CLIENT 结束、Demand Active（General/Bitmap 24bpp/Order/Pointer/Input/Share/Font/ColorCache/VirtualChannel）→ 校验 Confirm Active（取客户端首选色深 16/24/32）、收客户端 Synchronize/Control/Font List 后回 Synchronize/Control Cooperate/Granted/Font Map，然后按客户端色深推送未压缩 Bitmap Update（分块 ≤16 KB）和一枚 24bpp 彩色指针；激活后读循环丢弃慢路径/fast-path 输入（G3-2 再路由），Refresh Rect 重发帧，Shutdown Request 或客户端 DPU 时关闭。握手超时、空闲超时、并发上限、每连接 goroutine 随 `Serve` 上下文取消而退出。`cmd/rdpserve` 是对应的验证 CLI。服务端不连接任何上游目标（G3-3 网关再做），也不做 NLA/CredSSP、Standard RDP Security、输入处理、虚拟通道数据或 orders。
+# 构建 Web 界面
+cd web/monitor && npm ci && npm run build && cd ../..
 
-当前里程碑：TPKT 帧、X.224 安全协议协商、严格验证服务器证书的 TLS，MCS Connect-Initial/Response（BER）与 GCC Basic Settings Exchange（PER，含对协商结果的重确认），Erect Domain / Attach User / Channel Join（用户通道 + I/O 通道），Client Info PDU（Secure Settings Exchange），MS-RDPELE 许可（New License Request / Platform Challenge Response / STATUS_VALID_CLIENT / New·Upgrade License MAC 校验），Demand Active / Confirm Active 能力交换，Synchronize / Control / Font List / Font Map 连接收尾，以及 Font Map 之后的服务端输出观察（Save Session Info 登录通知、Slow-Path Update / Pointer 分类计数、Deactivate All 重激活），Fast-Path 输出（TS_FP_UPDATE_PDU 按首字节与 TPKT 区分、分片重组、各 updateCode 分发到同一套处理），Bitmap Update 解码（Interleaved RLE 解压，8/15/16/24/32bpp 与 Palette Update 转 RGBA 帧缓冲，`rdpprobe -png` 可导出），以及指针渲染（Color/New/Large 指针的 XOR/AND 掩码转 RGBA 光标、按 Pointer Capability 容量缓存、Cached/Position/Null/Default 状态，`rdpprobe -cursor-png` 导出，位置已知时合成到 `-png`；orders 不解析）；单元/fuzz 测试和隔离 xrdp 互操作验证到 Font Map 后解码出的 xrdp 登录界面 / xfce 桌面画面与光标。默认只请求 TLS，`Options.NLA` 时只请求 PROTOCOL_HYBRID 并完成 CredSSP 6 / NTLMv2（`rdpprobe -nla`）；两种模式都不回退到 Standard RDP Security，服务端选了别的协议即失败。`Probe`/`Connect` 不发送 Client Info；`Activate` 发送 Client Info，只有调用方显式给出密码时才设置 INFO_AUTOLOGON。
+# 固定目标模式
+./bin/rdpgw -listen 0.0.0.0:33892 -target 192.0.2.20:3389 -target-pin <sha256>
 
-内核要求 `CGO_ENABLED=0` 可构建，使用 Go 标准库，不引入协议替身。UI、OCR 和视频导出属于后续独立审核范围。
+# 登录表单 + Web 界面
+RDPGW_MONITOR_TOKEN=<token> ./bin/rdpgw -listen 0.0.0.0:33892 -login-form \
+  -allow-target 192.0.2.0/24 -target-pin 192.0.2.20=<sha256> \
+  -monitor 127.0.0.1:8090 -monitor-ui web/monitor/dist -web-users users.txt
+```
 
-- 迁移计划：`../docs/development/closed-source-go-kernel-plan.md`
-- 使用文档（部署、参数、Web 界面）：`docs/USAGE.md`
-- 开发文档（架构、构建测试、API、前端 i18n）：`docs/DEVELOPMENT.md`
-- 来源和边界：`docs/SOURCES.md`
-- 测试环境、执行步骤与实际结果：`docs/VALIDATION.md`
+然后用 mstsc / xfreerdp 连接网关地址，或打开 `http://127.0.0.1:8090` 使用浏览器客户端。完整参数说明见使用文档。
 
-目录：`wire`（TPKT、X.224、RDP_NEG_*、BER/PER 工具、MCS Connect/域/Send Data PDU、GCC 与 Client/Server Core/Security/Network Data、Basic Security Header、Client Info、Share Control/Data、Demand/Confirm Active 与能力集、Synchronize/Control/Font List/Font Map、Save Session Info/Slow-Path Update/Pointer、Fast-Path 输出 PDU 与分片；G3-1 起两端方向都有：Connection Request 解码 / Connection Confirm·NEG_FAILURE 编码、Connect-Initial 解码 / Connect-Response（规范 BER 整数）编码、Erect Domain / Attach User / Channel Join 请求解码与 Confirm/失败编码、Disconnect Provider Ultimatum、ConferenceCreateRequest 解析 / ConferenceCreateResponse 与 SC_CORE/SC_SECURITY/SC_NET 编码、CS_CORE/CS_SECURITY/CS_NET 解码、Client Info 解码（Unicode/ANSI、可选扩展段）、Demand Active / Deactivate All / Font Map / Set Error Info / 服务端 Synchronize·Control 编码、Font List 解码、Bitmap Update / Pointer（System/Position/Cached/Color/New）编码）、`bitmap`（Interleaved RLE 解压、RGBA 帧缓冲、指针 XOR/AND 掩码解码与缓存、光标合成）、`licensing`（MS-RDPELE 客户端状态机、许可密钥派生、RC4、许可 MAC、专有证书与 X.509 链中的 RSA 公钥）、`server`（G3-1 服务端角色：`Config{TLS, Authorize, Handler, Desktop, Pointer, HandshakeTimeout, IdleTimeout, MaxSessions, Logf, OnSession}`、`New`/`Serve(ctx, ln)`、`Peer`/`Summary`、`Frame`/`TestPattern`/`DefaultPointer`；G3-3 起 `Handler func(ctx, *Conn) error` 在许可后接管连接，`Conn` 提供 `Peer/Credentials/ReadPDU/WriteIO/WriteFastPath/Deny/Disconnect/SetDeadline/Close`）、`gateway`（G3-3 网关：`Config{TLS, Route, AllowCapability, HandshakeTimeout, MaxSessions, Logf, OnSession, OnRelay}`、`Target{Address, ServerName, RootCAs, Timeout}`、`DefaultAllowCapability`、relay `Summary`）、`cmd/rdpgw`（网关 CLI，`-listen`/`-cert`/`-key`/`-target`/`-target-ca`/`-target-name`/`-target-timeout`/`-allow-user`/`-allow-domain`/`-handshake-timeout`/`-max-sessions`/`-once`/`-json`）、`cmd/rdpserve`（服务端验证 CLI，`-listen`/`-cert`/`-key`（缺省临时自签名）/`-user`/`-domain`/`-password-env`/`-handshake-timeout`/`-idle-timeout`/`-max-sessions`/`-once`/`-json`）、`transport`（TLS-only 探测 `Probe`、到 Channel Join 的 `Connect`、到 Font Map 的 `Activate`，`Options.Observe`/`Render` 在 Font Map 后读慢路径 + fast-path 输出并渲染）、`cmd/rdpprobe`（CLI，`-stage tls|channel-join|client-info|license|capabilities|activated`，`-observe`/`-png`/`-cursor-png`，凭据只经 `-user`/`-password-env` 传入）、`testenv/xrdp` 与 `scripts/xrdp-env.sh`（隔离 xrdp 测试服务器与一次性测试账号，仅 Linux VM）。
+## 架构
 
-仅在明确授权的目标上运行。不得把 TLS、Channel Join 或 Font Map 解释为用户已认证、桌面已显示或完整 RDP 会话已通过：Font Map 之后只解码 Bitmap Update 与指针（orders、Surface Commands、编解码器不处理），没有输入和虚拟通道；发送凭据时本工具只报告收到的 Save Session Info / Set Error Info，服务端不发（xrdp 0.9.24 就不发）时登录结果仍不可知。尚未实现：NLA/CredSSP、Standard RDP Security、基础位图/指针之外的图形、输入、虚拟通道。服务端角色（`server`/`rdpserve`）单独使用时只到 G3-1：静态测试图案和一枚光标，不是桌面，输入被丢弃；网关（`gateway`/`rdpgw`）只透传 I/O 通道与 fast-path，不转发静态/动态虚拟通道（剪贴板、驱动器、声音），不做 NLA，不能把 TLS 握手或转发成功解释为目标已认证——登录结果仍只在目标侧日志体现；真实客户端验证只做了 xfreerdp 2.6.1（见 `docs/VALIDATION.md` 5.7/5.8），mstsc 与 Windows 目标未测。
+```
+RDP 客户端 / 浏览器 ──► server（前端：X.224/TLS/NLA、MCS、许可、能力协商）
+                            │  可选 form 登录表单
+                            ▼
+                        gateway（路由策略、通道透传、监控分接、录像）
+                            │
+                            ▼
+                        transport + nla + licensing（后端：CredSSP/NTLMv2、目标证书校验）
+                            │
+                            ▼
+                        Windows 主机
+```
+
+目录：`wire`（协议编解码）、`transport`（客户端连接状态机）、`nla`（CredSSP/NTLM 客户端与服务端）、`licensing`（MS-RDPELE）、`bitmap`（RLE 解码、帧缓冲、指针）、`server`（服务端角色）、`form`（登录表单）、`gateway`（网关与 relay）、`monitor`（监控 HTTP/WebSocket API、录像）、`web/monitor`（React 前端）、`cmd`（rdpgw / rdpserve / rdpprobe）。
+
+## 测试
+
+```sh
+go vet ./... && go test ./...
+cd web/monitor && npx tsc -b --noEmit
+```
+
+真机互操作验证记录见验证文档。
+
+## 文档
+
+- [使用文档](docs/USAGE.md)：部署、全部命令行参数、Web 界面使用、安全建议、故障排查
+- [开发文档](docs/DEVELOPMENT.md)：架构、包职责、构建测试、监控 API、录像格式、前端与 i18n
+- [验证记录](docs/VALIDATION.md)：测试环境、执行步骤与真机实测结果
+- [来源与边界](docs/SOURCES.md)：实现参考的公开规范与代码来源说明
