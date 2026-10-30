@@ -1,14 +1,9 @@
 # RDP
 
-**[中文简介](#中文简介) · [中文文档](docs/USAGE.md)**
-
 An RDP (Remote Desktop Protocol) kernel and gateway written in pure Go: no CGO, no third-party protocol libraries. The wire protocol is implemented from scratch — TPKT/X.224, MCS, GCC, licensing, capability exchange, bitmap decoding and input forwarding — and ships as ready-to-use command-line tools plus a gateway with a web UI.
-
-## 中文简介
 
 用 Go 标准库实现的 RDP 内核与网关：不依赖 CGO 和第三方协议库，从 TPKT/X.224、MCS、许可、能力协商一路实现到画面解码与输入转发，并在此基础上提供命令行工具和带 Web 界面的网关。RDP 客户端或浏览器经网关接入内网 Windows 主机，支持登录表单、NLA、证书指纹固定、剪贴板/磁盘/音频通道、浏览器内远程桌面、实时监控与接管、会话录像回放，界面中英文双语。
 
-中文文档：[使用文档](docs/USAGE.md) · [开发文档](docs/DEVELOPMENT.md) · [验证记录](docs/VALIDATION.md) · [来源与边界](docs/SOURCES.md)
 
 ## Features
 
