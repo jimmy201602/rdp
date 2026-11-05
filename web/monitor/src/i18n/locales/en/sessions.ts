@@ -19,6 +19,7 @@ const en: typeof zh = {
     controllers: '{{count}} co-controlling',
     recording: 'Recording',
     decodeErrors: 'Decode errors {{count}}',
+    remoteApp: 'RemoteApp {{app}}',
   },
   watch: 'Monitor',
   disconnectConfirm: 'Disconnect this session?',

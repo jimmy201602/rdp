@@ -6,6 +6,7 @@ const en: typeof zh = {
   empty: 'No recordings (the gateway needs -record-dir)',
   column: { started: 'Started', user: 'User', target: 'Target', client: 'Client', resolution: 'Resolution', duration: 'Duration', size: 'Size', end: 'End', actions: 'Actions' },
   play: 'Play',
+  remoteApp: 'RemoteApp {{app}}',
   deleteConfirm: 'Delete this recording?',
   deleted: 'Deleted',
 };

@@ -90,6 +90,8 @@ func sendClientInfo(conn net.Conn, opts Options, res *Result) error {
 		Domain:           opts.Domain,
 		UserName:         opts.UserName,
 		Password:         opts.Password,
+		AlternateShell:   opts.AlternateShell,
+		WorkingDir:       opts.WorkingDir,
 		ClientDir:        clientName(opts),
 		TimeZone:         wire.UTCTimeZone,
 		PerformanceFlags: opts.performanceFlags(),
@@ -98,6 +100,17 @@ func sendClientInfo(conn net.Conn, opts Options, res *Result) error {
 	if opts.Password != "" {
 		ci.Flags |= wire.InfoAutoLogon
 		res.AutoLogon = true
+	}
+	if opts.Rail {
+		// INFO_RAIL only: INFO_HIDEF_RAIL_SUPPORTED would make Windows 8.1+
+		// draw RemoteApp windows through the graphics pipeline (rdpgfx DVC)
+		// instead of bitmap updates; without the DVC the target reports
+		// ERRINFO_GRAPHICS_SUBSYSTEM_FAILED. Classic RAIL keeps the output
+		// decodable for the monitor.
+		ci.Flags |= wire.InfoRail
+		if ci.AlternateShell == "" {
+			ci.AlternateShell = "rdpinit.exe"
+		}
 	}
 	if addr, ok := conn.LocalAddr().(*net.TCPAddr); ok && addr.IP != nil {
 		ci.ClientAddress = addr.IP.String()

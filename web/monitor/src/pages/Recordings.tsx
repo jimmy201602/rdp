@@ -57,7 +57,7 @@ export default function Recordings() {
         columns={[
           { title: t('column.started'), dataIndex: 'started', render: (v) => dayjs(v).format('YYYY-MM-DD HH:mm:ss'), defaultSortOrder: 'descend', sorter: (a, b) => dayjs(a.started).valueOf() - dayjs(b.started).valueOf() },
           { title: t('column.user'), render: (_, r) => account(r) },
-          { title: t('column.target'), dataIndex: 'target' },
+          { title: t('column.target'), dataIndex: 'target', render: (v, r) => (r.remoteapp ? <>{v} <Tag color="purple">{t('remoteApp', { app: r.app || '…' })}</Tag></> : v) },
           { title: t('column.client'), dataIndex: 'remote_addr' },
           { title: t('column.resolution'), render: (_, r) => (r.width ? `${r.width}×${r.height}` : '-') },
           { title: t('column.duration'), dataIndex: 'duration_ms', render: fmtDuration, sorter: (a, b) => a.duration_ms - b.duration_ms },

@@ -1,7 +1,7 @@
 import type zh from '../zh/events';
 
 const en: typeof zh = {
-  kind: { keyboard: 'Keyboard', mouse: 'Mouse', clipboard: 'Clipboard', file: 'File', device: 'Mapped device', system: 'System' },
+  kind: { keyboard: 'Keyboard', mouse: 'Mouse', clipboard: 'Clipboard', file: 'File', device: 'Mapped device', rail: 'RemoteApp', window: 'Window', system: 'System' },
   source: { client: 'User', target: 'Target', admin: 'Monitor', gateway: 'Gateway' },
   action: {
     input: 'Key press (content hidden)', move: 'Move', button_down: 'Mouse down', button_up: 'Mouse up', wheel: 'Wheel',
@@ -10,6 +10,8 @@ const en: typeof zh = {
     delete: 'Mark for deletion', rename: 'Rename', set_info: 'Change attributes', announce: 'Map device', remove: 'Unmap device',
     browse: 'Monitor browse', admin_download: 'Mapped drive → monitor download', admin_upload: 'Monitor → mapped drive upload', admin_delete: 'Monitor delete',
     events_dropped: 'Events dropped',
+    exec: 'Start program', exec_result: 'Start result', handshake: 'RemoteApp handshake',
+    new: 'New window', title: 'Title changed', show: 'Show state', activate: 'Window activated', closed: 'Window closed',
   },
   device: 'Device {{id}}',
   allKinds: 'All types',

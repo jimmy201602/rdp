@@ -46,7 +46,14 @@ type Peer struct {
 	UserName      string
 	Password      string
 	AutoLogon     bool
-	Channels      []string // static virtual channels the client asked for
+	// Rail is set when the Client Info PDU carries INFO_RAIL: the client
+	// wants a RemoteApp (RAIL) session rather than a full desktop.
+	// AlternateShell and WorkingDir are the TS_INFO_PACKET fields the
+	// client supplied (for RAIL clients the shell is "rdpinit.exe").
+	Rail           bool
+	AlternateShell string
+	WorkingDir     string
+	Channels       []string // static virtual channels the client asked for
 	// NLA reports that UserName/Domain were proven by CredSSP (NTLMv2)
 	// before MCS and that Password is the delegated credential (empty when
 	// the client delegated nothing).

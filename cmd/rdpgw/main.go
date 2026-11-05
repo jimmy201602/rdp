@@ -61,6 +61,7 @@ func main() {
 	keyFile := flag.String("key", "", "front-end PEM private key")
 	target := flag.String("target", "", "target host:port (required without -login-form)")
 	loginForm := flag.Bool("login-form", false, "show every client a logon form and dial the server it enters instead of -target")
+	userTarget := flag.Bool("user-target", false, "with -login-form: a client connecting as user@host[:port] with a password skips the form and is relayed to host (subject to -allow-target). Required for RemoteApp (RAIL) clients, which cannot show the form; the .rdp file then has remoteapplicationmode:i:1 and username:s:user@host")
 	allowTarget := flag.String("allow-target", "", "with -login-form: comma-separated hosts, IPs or CIDRs the user may enter (empty: any; -target, if set, is always allowed)")
 	formAttempts := flag.Int("form-attempts", 5, "with -login-form: failed attempts before the client is disconnected")
 	formIdle := flag.Duration("form-idle", 5*time.Minute, "with -login-form: disconnect a client that leaves the form idle this long")
@@ -217,6 +218,11 @@ func main() {
 			accounts[strings.ToLower(user)] = password
 		}
 		lookup = func(user, _ string) (string, bool) {
+			if *userTarget {
+				if i := strings.LastIndexByte(user, '@'); i > 0 {
+					user = user[:i] // user@host: the host is the route, not the account
+				}
+			}
 			password, ok := accounts[strings.ToLower(user)]
 			return password, ok
 		}
@@ -277,6 +283,7 @@ func main() {
 		// -allow-domain apply to the identity the client presented up front
 		// (NLA or Client Info), when there is one.
 		cfg.Route = nil
+		cfg.UserTarget = *userTarget
 		cfg.Form = &gateway.FormConfig{
 			Attempts: *formAttempts, IdleTimeout: *formIdle, Prefill: true,
 			Route: func(_ context.Context, p server.Peer, address string) (gateway.Target, error) {

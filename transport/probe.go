@@ -81,6 +81,17 @@ type Options struct {
 	// AutoReconnect is an ARC_CS_PRIVATE_PACKET (wire.ARCCookie.ClientPacket)
 	// sent in the Client Info PDU to rejoin a session after a lost connection.
 	AutoReconnect []byte
+	// Rail requests a RemoteApp (RAIL) session: INFO_RAIL is set in the
+	// Client Info PDU (classic RAIL, not HiDef/graphics pipeline) and the
+	// server starts the RemoteApp shell instead of a desktop. The program
+	// itself is launched later over the "rail" static virtual channel
+	// (TS_RAIL_ORDER_EXEC), which the caller must include in Channels.
+	Rail bool
+	// AlternateShell and WorkingDir fill the TS_INFO_PACKET fields of the
+	// same name (at most 255 characters each). RAIL clients send
+	// "rdpinit.exe" as the shell; a full-desktop logon leaves both empty.
+	AlternateShell string
+	WorkingDir     string
 	// Channels are the static virtual channels requested in Client Network
 	// Data (at most 31) and joined after the I/O channel. Dial exposes the
 	// allocated IDs via Session.StaticChannels in the same order. Empty

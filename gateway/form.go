@@ -44,6 +44,18 @@ var ErrFormAttempts = errors.New("rdp gateway: too many failed logon attempts")
 func (g *Gateway) handleForm(ctx context.Context, c *server.Conn) error {
 	cfg := g.cfg.Form
 	peer := c.Peer()
+	if user, host, ok := splitUserTarget(peer.UserName); g.cfg.UserTarget && ok {
+		creds := c.Credentials()
+		if peer.Rail || creds.Password != "" {
+			peer.UserName, creds.UserName = user, user
+			return g.relayUserTarget(ctx, c, peer, host, creds)
+		}
+	}
+	if peer.Rail {
+		g.cfg.Logf("%s: RemoteApp client %q cannot use the logon form; set -user-target and connect as user@host", peer.RemoteAddr, peer.ClientName)
+		_ = c.Deny(wire.ErrInfoServerDeniedConnection)
+		return fmt.Errorf("%w: RemoteApp client without user@host target", server.ErrDenied)
+	}
 	act, err := c.Activate()
 	if err != nil {
 		return err
@@ -126,6 +138,42 @@ func (g *Gateway) handleForm(ctx context.Context, c *server.Conn) error {
 	}
 }
 
+// splitUserTarget splits "user@host[:port]" (Config.UserTarget). A plain
+// user name, or one whose suffix is not a host ("user@", "@host"), is
+// reported as not ok.
+func splitUserTarget(user string) (name, host string, ok bool) {
+	i := strings.LastIndexByte(user, '@')
+	if i <= 0 || i == len(user)-1 {
+		return user, "", false
+	}
+	name, host = user[:i], user[i+1:]
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		host = net.JoinHostPort(strings.Trim(host, "[]"), "3389")
+	}
+	return name, host, true
+}
+
+// relayUserTarget routes a user@host client through Form.Route and relays
+// it with its own credentials, skipping the form (the only path a RemoteApp
+// client can take in form mode).
+func (g *Gateway) relayUserTarget(ctx context.Context, c *server.Conn, peer server.Peer, address string, creds server.Credentials) error {
+	target, err := g.cfg.Form.Route(ctx, peer, address)
+	if err != nil {
+		g.cfg.Logf("%s: route denied user %q target %s client %q: %v", peer.RemoteAddr, peer.UserName, address, peer.ClientName, err)
+		_ = c.Deny(wire.ErrInfoServerDeniedConnection)
+		return fmt.Errorf("%w: %v", server.ErrDenied, err)
+	}
+	if target.Address == "" {
+		target.Address = address
+	}
+	if target.NLA && creds.Password == "" {
+		g.cfg.Logf("%s: user %q target %s needs a password for NLA", peer.RemoteAddr, peer.UserName, target.Address)
+		_ = c.Deny(wire.ErrInfoServerDeniedConnection)
+		return fmt.Errorf("%w: %s: %w", ErrBackend, target.Address, transport.ErrNoCredentials)
+	}
+	return g.relayTo(ctx, c, peer, target, creds)
+}
+
 // dialForm connects to the server the user asked for and, on success,
 // deactivates the form so the target's Demand Active re-activates the
 // client through the relay.
@@ -159,6 +207,7 @@ func (g *Gateway) dialForm(ctx context.Context, c *server.Conn, peer server.Peer
 		ClientName: targetClientName(peer.ClientName), DesktopWidth: peer.DesktopWidth, DesktopHeight: peer.DesktopHeight, ColorDepth: depth,
 		Channels: channels.defs,
 		Domain:   vals.Domain, UserName: vals.UserName, Password: vals.Password,
+		AlternateShell: peer.AlternateShell, WorkingDir: peer.WorkingDir,
 	}
 	backend, err := transport.Dial(ctx, target.Address, opts)
 	opts = transport.Options{}

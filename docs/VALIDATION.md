@@ -272,6 +272,29 @@ VM 真实链路：Ubuntu 22.04 + Xvfb :99，xfreerdp 2.6.1 → `rdpgw 127.0.0.1:
 
 说明：本机 Homebrew xfreerdp 3.31.1（OpenSSL 3）无法与仅 TLS 1.0 的 Win7 完成握手（`/tls:seclevel:0`、`/tls:enforce:1.0` 均 `BIO_do_handshake failed`），因此 Win7 的 NLA 对照只能用 `rdpprobe`。RC4 回退仅在 NLA 且已协商出 TLS 1.0 CBC 时触发，TLS-only 路径不变（TPKT 在多条记录间重组，不受拆分影响）。
 
+### 5.12 G3-7（2026-11-05，RemoteApp / RAIL：本机 xfreerdp /app → rdpgw → Windows Server 2016 记事本 RemoteApp，含监控录像）
+
+目标 192.0.2.20（Server 2016，`TSAppAllowList` 已注册 `Notepad`），前端 xfreerdp 3.33 `"/app:program:||Notepad" /size:1280x800`，网关分别以固定目标模式与登录表单模式运行。
+
+| 操作 | 结果 |
+|---|---|
+| `rdpgw -listen 127.0.0.1:33892 -login-form -user-target -allow-target 192.0.2.20 -target-nla -target-pin … -monitor 127.0.0.1:8090 -record-dir …`；xfreerdp `/u:administrator@192.0.2.20 /p:… /app:program:\|\|Notepad` | 网关按 `user@host` 跳过表单直接路由：`licensed (… channels [rdpdr rail rdpsnd cliprdr drdynvc], remoteapp true), relaying`；`/api/sessions` 给出 `remoteapp:true, app:"||Notepad"`，记事本窗口在 xfreerdp 中以独立窗口出现，会话持续到客户端主动关闭（`client-closed`），`dropped caps map[28:1 29:1 30:1]`（Surface Commands / Codecs / Frame Ack 照旧丢弃，RAIL 0x17 / Window 0x18 放行） |
+| `rdpgw -listen 127.0.0.1:33893 -target 192.0.2.20:3389 -target-nla -target-pin …`；xfreerdp `/u:administrator /app:program:\|\|Notepad` | 固定目标模式同样成功：`channels map[cliprdr:5 drdynvc:29 rail:18 rdpdr:13]`，rail 通道双向各有数据，无 Set Error Info |
+| 录像 `.rdpv` 解码（读取器 + 事件） | 元数据 `remoteapp:true, app:"||Notepad"`；事件依次为 `rail/handshake`（目标）、三条 `window/new`（其中一条 `detail:"无标题 - 记事本", x:34, y:187, w:477, h:523, status:shown`）、`rail/exec path:"||Notepad"`（客户端）、`rail/exec_result status:ok`（目标）；按帧回放出来的最终画面是黑底上的记事本窗口（RemoteApp 会话没有桌面背景，位图更新只覆盖窗口区域） |
+| 失败对照 | 第一版在后端 Client Info 里同时置 `INFO_RAIL | INFO_HIDEF_RAIL_SUPPORTED`：目标登录成功、`Shell start notification` 后 1–2 s 发 `ERRINFO_GRAPHICS_SUBSYSTEM_FAILED (0x112F)` 并复位连接，不带 `-monitor`（不清 orders）同样失败，直连 xfreerdp（走 GFX）正常。去掉 HiDef 标志后恢复：Server 2016 的 HiDef RAIL 要求 rdpgfx 动态通道管线，而网关后端不提供 GFX |
+
+说明：RemoteApp 会话的桌面尺寸由目标按客户端屏幕布局决定（本机 1792×1090），录像分辨率随之；窗口订单（TS_ALTSEC_WINDOW）只在 fast-path orders 更新里解析，图标/通知区订单按长度跳过；监控端不显示窗口边框叠加，画面即目标发来的位图。
+
+**Windows App（macOS）`.rdp` 文件接入**：`full address:s:127.0.0.1:33892`、`username:s:administrator@192.0.2.20`、`remoteapplicationmode:i:1`、`remoteapplicationprogram:s:||Notepad`、`alternate shell:s:rdpinit.exe`。
+
+| 操作 | 结果 |
+|---|---|
+| 网关仅 TLS（无 `-nla-users`） | Windows App 走到 Client Info 但不带密码（它只通过 CredSSP 传凭据），网关 `needs a password for NLA` 拒绝，客户端显示 `Error code: 0x7` |
+| 网关加 `-nla-users`（前端 NLA）+ `-user-target` | `credssp v6 user "administrator@192.0.2.20" … delegated=true` → 去掉 `@host` 后查账号、按 host 路由；`licensed (… channels [rdpdr rdpsnd rail rail_wi rail_ri cliprdr drdynvc], remoteapp true)`（Windows App 额外请求 `rail_wi`/`rail_ri` 通道，透传）；用户在记事本里用输入法打字、拖动窗口、关闭并在“是否保存”对话框选不保存，目标随即结束会话（`target-closed`，最后一个 RemoteApp 窗口关闭后的正常行为）；relay `client 5 pdus + 299 fast-path, target 9 pdus + 264 fast-path, input map[mouse:237 qoe:280 scancode:43 sync:19], channels map[cliprdr:4 drdynvc:27 rail:29 rdpdr:12]` |
+| 录像（46.6 s，1792×1120） | `remoteapp:true, app:"||Notepad"`；事件：`rail/handshake`、`rail/exec`、`window/new "无标题 - 记事本" 477×523`、`rail/exec_result ok`、`window/move`（拖动，每秒最多一条）、输入法 `CiceroUIWndFrame`/`CandidateWindow` 窗口的 new/show/closed、`window/new "记事本"`（保存提示框）、`window/activate`、`window/closed "无标题 - 记事本"`；按帧合成到 22.5 s 的画面是带输入内容的记事本窗口，结束时画面全黑（窗口关闭后目标把该区域重绘为背景） |
+
+mstsc（Windows 客户端）未在本轮实测。
+
 ## 6. 本轮验证不覆盖
 
 - 用户认证结果的协议层判定：无 NLA/CredSSP；xrdp 侧日志确认 INFO_AUTOLOGON 凭据登录成功并启动了 Xorg 会话，但观察窗口内没有收到任何 Save Session Info，探测器不能自行判定登录结果；Save Session Info / Set Error Info 解码只经单元测试验证。错误密码用例未跑（xrdp 失败时同样只在服务端日志体现）。
@@ -279,7 +302,7 @@ VM 真实链路：Ubuntu 22.04 + Xvfb :99，xfreerdp 2.6.1 → `rdpgw 127.0.0.1:
 - 图形：只解码 Slow-Path Bitmap Update（xrdp 上只出现 24bpp RLE，8/15/16/32bpp、未压缩位图和 Palette 只经单测；解码正确性靠肉眼比对 PNG，没有逐像素参考）；orders 不解析，Surface Commands 只计数；fast-path 分片重组、压缩标志拒绝、Large Pointer、Pointer Position 合成只经单测（xrdp 更新都很小、不发位置）；输入；其余 Share Data PDU 只按 pduType2 计数。
 - 静态虚拟通道只做透传（不解析 cliprdr/rdpdr/rdpsnd/drdynvc 协议，不做通道级策略如只读剪贴板）、消息通道、多传输通道；服务端分配的通道数与请求不符会被拒绝。
 - 公网目标、Standard RDP Security 服务器（探测器按设计拒绝）；Windows 目标只测了 Windows 7 SP1（TLS 1.0）与 Server 2016（NLA）各一台，均为自签名证书 + `-pin`，未测域账户 / Kerberos、HYBRID_EX、CredSSP 服务端要求 Early User Auth、NTLM 被禁用（只允许 Kerberos）的主机。
-- 网关：前端 NLA 只对 xfreerdp 3.31 的裸 NTLMSSP 令牌实测，mstsc 的 SPNEGO 包装只有单测；不做 Kerberos、HYBRID_EX / Early User Auth、智能卡凭据、NTLM 账户锁定/口令过期等状态码（失败一律 STATUS_LOGON_FAILURE）；`-nla-users` 为明文口令文件，没有哈希存储；目标证书必须经 `-target-ca`/系统根或 `-target-pin` 叶证书指纹验证，没有跳过选项；被过滤的能力（codecs/Surface Commands/Frame Ack/RAIL 等）意味着不支持 RemoteFX/GFX、RemoteApp；输入只透传并计数，不做键盘布局改写或策略拦截；重激活（Deactivate All）、客户端 Shutdown Request、多会话并发上限、握手超时只在单测/代码路径上；真实 Windows 目标与 mstsc 客户端未测。
+- 网关：前端 NLA 只对 xfreerdp 3.31 的裸 NTLMSSP 令牌实测，mstsc 的 SPNEGO 包装只有单测；不做 Kerberos、HYBRID_EX / Early User Auth、智能卡凭据、NTLM 账户锁定/口令过期等状态码（失败一律 STATUS_LOGON_FAILURE）；`-nla-users` 为明文口令文件，没有哈希存储；目标证书必须经 `-target-ca`/系统根或 `-target-pin` 叶证书指纹验证，没有跳过选项；被过滤的能力（codecs/Surface Commands/Frame Ack 等）意味着不支持 RemoteFX/GFX；RAIL/Window 能力只对带 INFO_RAIL 的客户端放行，且后端只请求经典 RAIL（不置 HiDef 标志、无 rdpgfx），RemoteApp 的 HiDef/GFX 绘制路径不支持；输入只透传并计数，不做键盘布局改写或策略拦截；重激活（Deactivate All）、客户端 Shutdown Request、多会话并发上限、握手超时只在单测/代码路径上；真实 Windows 目标与 mstsc 客户端未测。
 - 服务端角色：只对 xfreerdp 2.6.1（TLS）和 3.31（NLA，经网关）验证，mstsc/Windows 客户端、多显示器、Auto-Reconnect、Shutdown Request 真实路径、空闲超时、并发上限（只有单元/手工路径）未在真实客户端上验证；重激活只以“网关表单 → Deactivate All → 目标 Demand Active”这一种形态在 xfreerdp 3.31 上验证；位图只发未压缩矩形，没有压缩编码、fast-path 输出、orders（Demand Active 里声明它们只是为了保住后续目标的协商）。
 - 登录表单：只有中文提示、无 IME；表单画面不经压缩；`-allow-target` 只按地址做策略，没有按用户/时间的规则；`-target-credssp-legacy` 放弃 CredSSP 5/6 的 nonce 公钥绑定（CVE-2018-0886），只在配合 `-target-pin` 时才有意义，且 RC4 回退让 Win7 会话全程使用 RC4——这两项都是对 EOL 主机的兼容，不是推荐配置。
 - 证书验证关闭或降级路径：不存在该选项，也不计划提供。

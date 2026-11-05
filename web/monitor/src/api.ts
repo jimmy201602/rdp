@@ -9,6 +9,8 @@ export interface SessionInfo {
   client_name?: string;
   target: string;
   login_form?: boolean;
+  remoteapp?: boolean;
+  app?: string;
   width: number;
   height: number;
   started: string;
@@ -30,6 +32,8 @@ export interface RecordingMeta {
   client_name?: string;
   target: string;
   login_form?: boolean;
+  remoteapp?: boolean;
+  app?: string;
   width: number;
   height: number;
   started: string;

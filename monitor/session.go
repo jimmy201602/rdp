@@ -120,7 +120,7 @@ func (m *Monitor) Observe(o gateway.ObserveSession) gateway.Observer {
 		m: m, ctl: o, start: now, audit: newAudit(),
 		meta: Meta{
 			ID: newID(now), RemoteAddr: o.RemoteAddr, UserName: o.UserName, Domain: o.Domain,
-			ClientName: o.ClientName, Target: o.Target, LoginForm: o.LoginForm, Web: o.Web, Started: now,
+			ClientName: o.ClientName, Target: o.Target, LoginForm: o.LoginForm, Web: o.Web, RemoteApp: o.RemoteApp, Started: now,
 		},
 		viewers:  map[*viewer]struct{}{},
 		join:     make(chan *viewer),
@@ -177,6 +177,8 @@ type SessionInfo struct {
 	Target       string    `json:"target"`
 	LoginForm    bool      `json:"login_form,omitempty"`
 	Web          bool      `json:"web,omitempty"`
+	RemoteApp    bool      `json:"remoteapp,omitempty"`
+	App          string    `json:"app,omitempty"`
 	Owner        string    `json:"owner,omitempty"`
 	Width        int       `json:"width"`
 	Height       int       `json:"height"`
@@ -260,6 +262,7 @@ func (s *Session) Info() SessionInfo {
 	i := SessionInfo{
 		ID: s.meta.ID, RemoteAddr: s.meta.RemoteAddr, UserName: s.meta.UserName, Domain: s.meta.Domain,
 		ClientName: s.meta.ClientName, Target: s.meta.Target, LoginForm: s.meta.LoginForm, Web: s.meta.Web, Owner: s.owner,
+		RemoteApp: s.meta.RemoteApp, App: s.audit.appName(),
 		Width: s.meta.Width, Height: s.meta.Height, Started: s.meta.Started,
 		ServerBytes: s.serverBytes, Frames: s.frames, Orders: s.orders, DecodeErrors: s.decodeErrors,
 		Injected: s.injected, Recording: s.rec != nil,
@@ -335,6 +338,9 @@ func (s *Session) fastPath(data []byte) error {
 		case wire.FastPathUpdateOrders:
 			if n, err := wire.FastPathOrdersCount(d); err == nil {
 				s.orders += int(n)
+				if s.meta.RemoteApp && len(d) > 2 {
+					s.windowOrders(d[2:])
+				}
 			}
 		default:
 			if wire.IsFastPathPointer(u.Code) {
@@ -803,6 +809,7 @@ func (s *Session) finish(end []byte) {
 	s.mu.Lock()
 	m := s.meta
 	m.DurationMS = int64(s.ms())
+	m.App = s.audit.appName()
 	m.End, m.Size, m.Complete = s.end, size, err == nil
 	if s.endErr != nil {
 		m.Error = s.endErr.Error()

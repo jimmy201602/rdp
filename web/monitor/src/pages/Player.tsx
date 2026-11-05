@@ -221,6 +221,7 @@ export default function Player() {
           <Descriptions.Item label={t('meta.size')}>{fmtBytes(meta.size)}</Descriptions.Item>
           <Descriptions.Item label={t('meta.end')}>{endLabels[meta.end ?? ''] ?? meta.end ?? '-'}</Descriptions.Item>
           <Descriptions.Item label={t('meta.login')}>{meta.login_form ? t('meta.loginForm') : t('meta.directCredentials')}</Descriptions.Item>
+          {meta.remoteapp && <Descriptions.Item label={t('meta.remoteApp')}>{meta.app || '-'}</Descriptions.Item>}
           {meta.error && <Descriptions.Item label={t('meta.error')}>{meta.error}</Descriptions.Item>}
         </Descriptions>
       )}

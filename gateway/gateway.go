@@ -62,6 +62,12 @@ type Config struct {
 	// Form, when set, shows every client an interactive logon form and
 	// dials the server the user typed instead of calling Route.
 	Form *FormConfig
+	// UserTarget (form mode) lets a client name its target in the user
+	// name as "user@host[:port]": a client that also supplied a password
+	// (or delegated one through NLA) is routed via Form.Route without the
+	// form being shown. RemoteApp (RAIL) clients cannot display the form,
+	// so in form mode they must use this syntax; otherwise they are denied.
+	UserTarget bool
 	// NLA enables CredSSP on the front end (see server.Config.NLA): the
 	// identity proven by NTLMv2 reaches Route in Peer and the credentials
 	// the client delegated are what the target receives. RequireNLA refuses
@@ -121,6 +127,7 @@ type Summary struct {
 	DroppedChannels     map[string]int // chunks dropped on channels the policy refused
 	Reactivations       int
 	LoginForm           bool   // target and credentials came from the logon form
+	RemoteApp           bool   // RAIL session: the client asked for a RemoteApp, not a desktop
 	FormAttempts        int    // connection attempts made from the form (1 = first try)
 	InjectedInput       int    // input events injected through Config.Observe
 	End                 string // "client-closed", "target-closed", "canceled", "error"
@@ -132,7 +139,9 @@ type Summary struct {
 // enough to pass through: core, caches, pointer, input, fonts, virtual
 // channel sizing, large pointer and multifragment. Codecs, surface
 // commands, frame acknowledge, RAIL/window, nine-grid, GDI+ and desktop
-// composition are dropped so that neither side enables them.
+// composition are dropped so that neither side enables them. For RAIL
+// clients the relay additionally passes the Remote Programs and Window List
+// capability sets regardless of this filter (see Summary.RemoteApp).
 func DefaultAllowCapability(typ uint16) bool {
 	switch typ {
 	case wire.CapsTypeGeneral, wire.CapsTypeBitmap, wire.CapsTypeOrder, wire.CapsTypeBitmapCache,
@@ -211,6 +220,12 @@ func (g *Gateway) handle(ctx context.Context, c *server.Conn) error {
 		_ = c.Deny(wire.ErrInfoServerDeniedConnection)
 		return ErrNoTarget
 	}
+	return g.relayTo(ctx, c, peer, target, c.Credentials())
+}
+
+// relayTo dials target with the client's own credentials and relays the
+// session. RemoteApp clients get a RAIL logon towards the target.
+func (g *Gateway) relayTo(ctx context.Context, c *server.Conn, peer server.Peer, target Target, creds server.Credentials) error {
 	c.MarkAuthorized()
 	if target.Timeout <= 0 {
 		target.Timeout = 20 * time.Second
@@ -222,12 +237,12 @@ func (g *Gateway) handle(ctx context.Context, c *server.Conn) error {
 		depth = 24
 	}
 	channels := newChannelMap(c, g.cfg.AllowChannel)
-	creds := c.Credentials()
 	opts := transport.Options{
 		NLA: target.NLA, LegacyCredSSP: target.LegacyCredSSP, ServerName: target.ServerName, RootCAs: target.RootCAs, PinSHA256: target.PinSHA256, MinTLSVersion: target.MinTLS, Timeout: target.Timeout,
 		ClientName: targetClientName(peer.ClientName), DesktopWidth: peer.DesktopWidth, DesktopHeight: peer.DesktopHeight, ColorDepth: depth,
 		Channels: channels.defs,
 		Domain:   creds.Domain, UserName: creds.UserName, Password: creds.Password,
+		Rail: peer.Rail, AlternateShell: peer.AlternateShell, WorkingDir: peer.WorkingDir,
 	}
 	creds = server.Credentials{}
 	_ = creds
@@ -240,10 +255,10 @@ func (g *Gateway) handle(ctx context.Context, c *server.Conn) error {
 		return fmt.Errorf("%w: %s: %v", ErrBackend, target.Address, err)
 	}
 	channels.bind(backend.StaticChannels())
-	g.cfg.Logf("%s: target %s licensed (user channel %d, channels %v), relaying", peer.RemoteAddr, target.Address, backend.UserChannel(), channels.names())
+	g.cfg.Logf("%s: target %s licensed (user channel %d, channels %v, remoteapp %v), relaying", peer.RemoteAddr, target.Address, backend.UserChannel(), channels.names(), peer.Rail)
 	r := &relay{g: g, client: c, backend: backend, channels: channels, sum: Summary{
 		RemoteAddr: peer.RemoteAddr, UserName: peer.UserName, Domain: peer.Domain, ClientName: peer.ClientName, NLA: peer.NLA,
-		Target: target.Address, InputEvents: map[string]int{}, DroppedCapabilities: map[uint16]int{},
+		Target: target.Address, RemoteApp: peer.Rail, InputEvents: map[string]int{}, DroppedCapabilities: map[uint16]int{},
 		ChannelPDUs: map[string]int{}, DroppedChannels: map[string]int{},
 	}}
 	return r.run(ctx)
@@ -335,7 +350,7 @@ func (r *relay) run(ctx context.Context) error {
 	if r.g.cfg.Observe != nil {
 		r.obs = r.g.cfg.Observe(ObserveSession{
 			RemoteAddr: fmt.Sprint(r.sum.RemoteAddr), UserName: r.sum.UserName, Domain: r.sum.Domain, ClientName: r.sum.ClientName,
-			Target: r.sum.Target, LoginForm: r.sum.LoginForm,
+			Target: r.sum.Target, LoginForm: r.sum.LoginForm, RemoteApp: r.sum.RemoteApp,
 			Disconnect:   func() { r.kicked.Store(true); cancel() },
 			Inject:       r.inject,
 			DriveRequest: r.driveRequest,
@@ -614,7 +629,7 @@ func (r *relay) rewriteServerPDU(data []byte) ([]byte, error) {
 func (r *relay) filterCaps(sets []wire.CapabilitySet) []wire.CapabilitySet {
 	kept := make([]wire.CapabilitySet, 0, len(sets))
 	for _, s := range sets {
-		if r.g.cfg.AllowCapability(s.Type) {
+		if r.g.cfg.AllowCapability(s.Type) || r.railCapability(s.Type) {
 			if r.g.cfg.DriveControl && s.Type == wire.CapsTypeVirtualChannel && len(s.Data) >= 4 {
 				s.Data = append([]byte(nil), s.Data...)
 				clear(s.Data[:4]) // no virtual-channel compression in either direction
@@ -627,6 +642,13 @@ func (r *relay) filterCaps(sets []wire.CapabilitySet) []wire.CapabilitySet {
 		r.mu.Unlock()
 	}
 	return kept
+}
+
+// railCapability admits the Remote Programs and Window List capability sets
+// for RAIL sessions: without them the target starts a desktop instead of
+// the RemoteApp shell and never sends Window orders.
+func (r *relay) railCapability(typ uint16) bool {
+	return r.sum.RemoteApp && (typ == wire.CapsTypeRail || typ == wire.CapsTypeWindow)
 }
 
 func (r *relay) countInput(events []wire.InputEvent) {
@@ -653,6 +675,9 @@ type Observer interface {
 type ObserveSession struct {
 	RemoteAddr, UserName, Domain, ClientName, Target string
 	LoginForm                                        bool
+	// RemoteApp marks a RAIL session: the target draws application windows
+	// (Window orders, relayed on the "rail" channel) instead of a desktop.
+	RemoteApp bool
 	// Web marks a browser-initiated session (Gateway.ConnectWeb): there is
 	// no front-end RDP client and the Observer's viewer is the user.
 	Web bool

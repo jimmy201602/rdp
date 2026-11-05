@@ -19,10 +19,11 @@ export function readEvent(rec: Rec): AuditEvent | null {
     return { ...e, time: rec.time };
   } catch { return null; }
 }
-const kinds = ['keyboard', 'mouse', 'clipboard', 'file', 'device', 'system'];
+const kinds = ['keyboard', 'mouse', 'clipboard', 'file', 'device', 'rail', 'window', 'system'];
 const sources = ['client', 'target', 'admin', 'gateway'];
 const actions = [
   'input', 'move', 'button_down', 'button_up', 'wheel',
+  'exec', 'exec_result', 'handshake', 'new', 'title', 'show', 'activate', 'closed',
   'formats', 'data', 'file_data',
   'open', 'close', 'read_upload', 'write_download',
   'delete', 'rename', 'set_info', 'announce', 'remove',

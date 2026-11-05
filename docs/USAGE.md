@@ -8,6 +8,7 @@
 
 - **RDP 客户端经网关接入**：mstsc / xfreerdp 连接网关，网关转发到固定目标（`-target`），支持前端 TLS 和前端 NLA（`-nla-users`）。
 - **登录表单模式**（`-login-form`）：客户端连上后先看到网关绘制的登录表单，输入服务器地址、用户名和密码后，由网关连接所填的目标；可用 `-allow-target` 限制可选目标，失败可重试。
+- **RemoteApp（RAIL）**：客户端以 RemoteApp 模式连接（mstsc `.rdp` 的 `remoteapplicationmode:i:1`，xfreerdp `/app:`）时，网关向目标发起经典 RAIL 登录并透传 rail 通道与窗口订单，目标上只打开指定程序；监控与录像照常，并记录启动的程序与窗口事件。登录表单模式下需 `-user-target`，客户端以 `user@host` 指定目标（见 § 9）。
 - **Web 浏览器 RDP 客户端**（`-web-users`）：在监控界面登录后，直接在浏览器中打开远程桌面，无需安装客户端。
 - **实时监控与协同控制**：在浏览器里实时观看任意会话；开启 `-monitor-control` 后可加入键盘鼠标操作，也可强制断开会话。
 - **录像与回放（含音频）**：`-record-dir` 把每个会话保存为 `.rdpv` 文件；回放支持进度跳转、操作事件时间轴，以及 1× 速度下播放声音（音频以 IMA ADPCM 记录）。
@@ -128,6 +129,7 @@ export RDPGW_MONITOR_TOKEN='<token>'
 | `-allow-target` | 空（任意） | 用户可输入的主机、IP 或 CIDR，逗号分隔；设置了 `-target` 时它始终允许。同样约束 Web 连接 |
 | `-form-attempts` | `5` | 失败多少次后断开客户端 |
 | `-form-idle` | `5m0s` | 表单空闲多久后断开客户端 |
+| `-user-target` | `false` | 客户端以 `user@host[:port]` 为用户名并带密码（或经 NLA 委派凭据）连接时，跳过表单直接连到 host（仍受 `-allow-target` 约束）。RemoteApp 客户端无法显示表单，在表单模式下必须用此方式，否则被拒绝。配合 `-nla-users` 时账号文件里只写 `user`，`@host` 在查找前去掉 |
 
 ### 4.4 虚拟通道
 
@@ -283,6 +285,36 @@ xfreerdp /v:<网关地址>:33892 /sec:tls /cert:ignore
 `/cert:ignore` 仅用于测试；正式环境请为网关配置受信任证书（`-cert` / `-key`）。
 
 mstsc：在“计算机”中填写 `<网关地址>:33892`，按提示输入凭据。网关使用自签名证书时会出现证书警告。
+
+### 9.1 RemoteApp（RAIL）
+
+目标主机需已发布 RemoteApp（`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Terminal Server\TSAppAllowList\Applications\<别名>`，或 `fDisabledAllowList=1` 允许任意程序）。网关对带 `INFO_RAIL` 的客户端自动切换到 RemoteApp 中继，不需要额外参数；登录表单模式下要加 `-user-target`，因为 RemoteApp 客户端没有桌面可以显示表单。
+
+```sh
+# 固定目标模式
+./bin/rdpgw -listen 0.0.0.0:33892 -target 192.0.2.10:3389 -target-nla -target-pin <sha256> -record-dir ./recordings
+xfreerdp /v:<网关地址>:33892 /u:<user> /p:<password> "/app:program:||Notepad" /cert:ignore
+
+# 登录表单模式：用户名里带目标
+./bin/rdpgw -listen 0.0.0.0:33892 -login-form -user-target -allow-target 192.0.2.0/24 -target-nla -target-pin 192.0.2.10=<sha256> -record-dir ./recordings
+xfreerdp /v:<网关地址>:33892 /u:<user>@192.0.2.10 /p:<password> "/app:program:||Notepad" /cert:ignore
+```
+
+mstsc / Windows App 用 `.rdp` 文件：
+
+```text
+full address:s:<网关地址>:33892
+username:s:<user>@192.0.2.10
+remoteapplicationmode:i:1
+remoteapplicationname:s:Notepad
+remoteapplicationprogram:s:||Notepad
+alternate shell:s:rdpinit.exe
+disableremoteappcapscheck:i:1
+```
+
+Windows App（macOS）/ mstsc 只通过 CredSSP 传凭据，不会把密码写进 Client Info，因此网关必须开前端 NLA（`-nla-users`，账号文件里只写 `administrator:<password>`），否则会以 `0x7` 拒绝；xfreerdp 的 `/p:` 走 Client Info，不受此限。
+
+说明：网关向目标只请求经典 RAIL（不置 `INFO_HIDEF_RAIL_SUPPORTED`），窗口内容以位图更新传输，因此监控和录像都能解码；Windows 8.1+/Server 2016 的 HiDef RAIL（经 rdpgfx 动态通道绘制）不支持。会话列表、录像列表与回放页会标出 RemoteApp 及启动的程序；事件时间轴里的 `RemoteApp` 类型记录启动请求与结果，`窗口` 类型记录窗口的新建、标题、显示状态、移动（每秒最多一条）、激活与关闭。没有桌面背景，回放画面是黑底上的程序窗口。
 
 ## 10. 安全建议
 

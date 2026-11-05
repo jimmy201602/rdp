@@ -492,6 +492,8 @@ func (s *session) clientInfo(ctx context.Context) error {
 		return fmt.Errorf("%w: %v", ErrProtocol, err)
 	}
 	s.peer.AutoLogon = ci.Flags&wire.InfoAutoLogon != 0
+	s.peer.Rail = ci.Flags&wire.InfoRail != 0
+	s.peer.AlternateShell, s.peer.WorkingDir = ci.AlternateShell, ci.WorkingDir
 	if s.nla != nil {
 		// Client Info after NLA is not authenticated: keep the proven
 		// identity and use the delegated credentials (if any) downstream.

@@ -17,6 +17,7 @@ export default {
     controllers: '{{count}} 人协同',
     recording: '录制中',
     decodeErrors: '解码异常 {{count}}',
+    remoteApp: 'RemoteApp {{app}}',
   },
   watch: '监控',
   disconnectConfirm: '断开该会话？',

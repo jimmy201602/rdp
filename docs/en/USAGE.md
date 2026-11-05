@@ -10,6 +10,7 @@
 
 - **RDP clients connecting through the gateway**: mstsc / xfreerdp connect to the gateway, which forwards them to a fixed target (`-target`); front-end TLS and front-end NLA (`-nla-users`) are supported.
 - **Login form mode** (`-login-form`): after connecting, the client first sees a login form drawn by the gateway; the user enters the server address, username, and password, and the gateway then connects to the entered target. Use `-allow-target` to restrict the allowed targets; failures can be retried.
+- **RemoteApp (RAIL)**: when a client connects in RemoteApp mode (`remoteapplicationmode:i:1` in an mstsc `.rdp` file, `/app:` in xfreerdp), the gateway performs a classic RAIL logon towards the target and relays the rail channel and Window orders, so only the requested program opens on the target; monitoring and recording work as usual and additionally log the launched program and window events. In login form mode this needs `-user-target` and the client names the target as `user@host` (see § 9).
 - **Web browser RDP client** (`-web-users`): after logging in to the monitor UI, open a remote desktop directly in the browser without installing any client.
 - **Real-time monitoring and collaborative control**: watch any session live in the browser; with `-monitor-control` enabled you can join in with keyboard and mouse input, or forcibly disconnect a session.
 - **Recording and playback (with audio)**: `-record-dir` saves each session as a `.rdpv` file; playback supports seeking, an operation-event timeline, and audio playback at 1× speed (audio is recorded as IMA ADPCM).
@@ -130,6 +131,7 @@ The values and defaults below follow the output of `go run ./cmd/rdpgw -h`.
 | `-allow-target` | empty (any) | Hosts, IPs, or CIDRs the user may enter, comma-separated; if `-target` is set it is always allowed. Also constrains web connections |
 | `-form-attempts` | `5` | Disconnect the client after this many failed attempts |
 | `-form-idle` | `5m0s` | Disconnect the client after the form has been idle this long |
+| `-user-target` | `false` | A client connecting as `user@host[:port]` with a password (or NLA-delegated credentials) skips the form and is relayed to `host` (still subject to `-allow-target`). RemoteApp clients cannot show the form, so in form mode they must connect this way or are denied. With `-nla-users` the account file lists just `user`; `@host` is stripped before the lookup |
 
 ### 4.4 Virtual channels
 
@@ -285,6 +287,36 @@ xfreerdp /v:<gateway-address>:33892 /sec:tls /cert:ignore
 `/cert:ignore` is for testing only; in production, configure a trusted certificate for the gateway (`-cert` / `-key`).
 
 mstsc: enter `<gateway-address>:33892` in "Computer" and enter credentials when prompted. A certificate warning appears when the gateway uses a self-signed certificate.
+
+### 9.1 RemoteApp (RAIL)
+
+The target must publish the program as a RemoteApp (`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Terminal Server\TSAppAllowList\Applications\<alias>`, or `fDisabledAllowList=1` to allow any program). The gateway switches to RemoteApp relaying for every client whose Client Info carries `INFO_RAIL`; no extra flag is needed. In login form mode add `-user-target`, because a RemoteApp client has no desktop on which the form could be shown.
+
+```sh
+# Fixed target mode
+./bin/rdpgw -listen 0.0.0.0:33892 -target 192.0.2.10:3389 -target-nla -target-pin <sha256> -record-dir ./recordings
+xfreerdp /v:<gateway-address>:33892 /u:<user> /p:<password> "/app:program:||Notepad" /cert:ignore
+
+# Login form mode: the user name carries the target
+./bin/rdpgw -listen 0.0.0.0:33892 -login-form -user-target -allow-target 192.0.2.0/24 -target-nla -target-pin 192.0.2.10=<sha256> -record-dir ./recordings
+xfreerdp /v:<gateway-address>:33892 /u:<user>@192.0.2.10 /p:<password> "/app:program:||Notepad" /cert:ignore
+```
+
+mstsc / Windows App `.rdp` file:
+
+```text
+full address:s:<gateway-address>:33892
+username:s:<user>@192.0.2.10
+remoteapplicationmode:i:1
+remoteapplicationname:s:Notepad
+remoteapplicationprogram:s:||Notepad
+alternate shell:s:rdpinit.exe
+disableremoteappcapscheck:i:1
+```
+
+Windows App (macOS) and mstsc only send credentials through CredSSP and never put the password into Client Info, so the gateway needs front-end NLA (`-nla-users`, with just `administrator:<password>` in the account file); otherwise the connection is denied with `0x7`. xfreerdp's `/p:` goes through Client Info and is not affected.
+
+Notes: the gateway requests classic RAIL only (it does not set `INFO_HIDEF_RAIL_SUPPORTED`), so window contents arrive as bitmap updates and both monitoring and recording can decode them; HiDef RAIL (Windows 8.1+/Server 2016 drawing through the rdpgfx dynamic channel) is not supported. The session list, recording list and player mark RemoteApp sessions and the launched program; in the event timeline the `RemoteApp` kind logs the launch request and its result and the `Window` kind logs window creation, title, show state, moves (at most one per second), activation and close. There is no desktop background: playback shows the program windows on black.
 
 ## 10. Security Recommendations
 

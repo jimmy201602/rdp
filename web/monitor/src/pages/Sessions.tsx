@@ -54,7 +54,7 @@ export default function Sessions() {
         columns={[
           { title: t('col.user'), render: (_, s) => account(s) },
           { title: t('col.client'), dataIndex: 'remote_addr', render: (v, s) => (s.client_name ? `${v} (${s.client_name})` : v) },
-          { title: t('col.target'), dataIndex: 'target' },
+          { title: t('col.target'), dataIndex: 'target', render: (v, s) => (s.remoteapp ? <>{v} <Tag color="purple">{t('tag.remoteApp', { app: s.app || '…' })}</Tag></> : v) },
           { title: t('col.resolution'), render: (_, s) => (s.width ? `${s.width}×${s.height}` : '-') },
           { title: t('col.started'), dataIndex: 'started', render: (v) => dayjs(v).format('HH:mm:ss') },
           { title: t('col.duration'), render: (_, s) => fmtDuration(now - dayjs(s.started).valueOf()) },

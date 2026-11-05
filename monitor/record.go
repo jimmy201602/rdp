@@ -51,6 +51,8 @@ type Meta struct {
 	Target     string    `json:"target"`
 	LoginForm  bool      `json:"login_form,omitempty"`
 	Web        bool      `json:"web,omitempty"`
+	RemoteApp  bool      `json:"remoteapp,omitempty"` // RAIL session: windows, not a desktop
+	App        string    `json:"app,omitempty"`       // program the client launched (TS_RAIL_ORDER_EXEC)
 	Width      int       `json:"width"`
 	Height     int       `json:"height"`
 	Started    time.Time `json:"started"`
@@ -178,6 +180,13 @@ func scanRecording(path string) (Meta, error) {
 		m.DurationMS = int64(rec.Time)
 		if rec.Kind == RecEnd {
 			m.Complete = true
+		}
+		if rec.Kind == RecEvent && m.RemoteApp && m.App == "" {
+			// The header predates the TS_RAIL_ORDER_EXEC; recover the program.
+			var e Event
+			if json.Unmarshal(rec.Payload, &e) == nil && e.Kind == "rail" && e.Action == "exec" {
+				m.App = e.Path
+			}
 		}
 	}
 	if st, err := f.Stat(); err == nil {

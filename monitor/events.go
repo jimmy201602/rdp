@@ -26,6 +26,17 @@ type Event struct {
 	Detail string `json:"detail,omitempty"`
 	X      uint16 `json:"x,omitempty"`
 	Y      uint16 `json:"y,omitempty"`
+	W      uint16 `json:"w,omitempty"` // window events: size on the target desktop
+	H      uint16 `json:"h,omitempty"`
+}
+
+// windowState is what the monitor remembers of a RemoteApp window so that
+// only changes are logged (a drag produces dozens of Window orders).
+type windowState struct {
+	title string
+	show  uint8
+	x, y  int32
+	w, h  uint32
 }
 
 type Device struct {
@@ -49,6 +60,18 @@ type auditState struct {
 	queue      chan Event
 	dropped    atomic.Uint64
 	operations chan struct{}
+	windows    map[uint32]windowState
+	activeWnd  uint32
+	app        atomic.Pointer[string]
+}
+
+// appName is the program the client asked the target to start, "" until
+// the TS_RAIL_ORDER_EXEC was seen.
+func (a *auditState) appName() string {
+	if p := a.app.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 func newAudit() *auditState {
@@ -147,6 +170,10 @@ func (s *Session) channel(client bool, name string, data []byte) {
 	defer a.mu.Unlock()
 	if name == "cliprdr" {
 		s.clipboard(client, data)
+		return
+	}
+	if name == wire.RailChannel {
+		s.rail(client, data)
 		return
 	}
 	if name != "rdpdr" {

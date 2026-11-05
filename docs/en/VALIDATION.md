@@ -274,6 +274,29 @@ Real chain: macOS + XQuartz, xfreerdp 3.31.1 (`/cert:ignore`, default negotiatio
 
 Notes: the local Homebrew xfreerdp 3.31.1 (OpenSSL 3) cannot complete a handshake with TLS 1.0-only Win7 (`/tls:seclevel:0` and `/tls:enforce:1.0` both fail with `BIO_do_handshake failed`), so the Win7 NLA cross-check could only be done with `rdpprobe`. The RC4 fallback triggers only for NLA when TLS 1.0 CBC has been negotiated; the TLS-only path is unchanged (TPKT is reassembled across multiple records and is unaffected by splitting).
 
+### 5.12 G3-7 (2026-11-05, RemoteApp / RAIL: local xfreerdp /app → rdpgw → Windows Server 2016 Notepad RemoteApp, with monitoring and recording)
+
+Target 192.0.2.20 (Server 2016, `Notepad` registered in `TSAppAllowList`), front end xfreerdp 3.33 `"/app:program:||Notepad" /size:1280x800`, gateway run in fixed-target and in login-form mode.
+
+| Step | Result |
+|---|---|
+| `rdpgw -login-form -user-target -allow-target 192.0.2.20 -target-nla -target-pin … -monitor 127.0.0.1:8090 -record-dir …`; xfreerdp `/u:administrator@192.0.2.20 /p:… /app:program:\|\|Notepad` | Routed by `user@host` without the form: `licensed (… channels [rdpdr rail rdpsnd cliprdr drdynvc], remoteapp true), relaying`; `/api/sessions` reports `remoteapp:true, app:"||Notepad"`; Notepad appears as a separate window in xfreerdp; the session lasts until the client closes it (`client-closed`); `dropped caps map[28:1 29:1 30:1]` (Surface Commands / Codecs / Frame Ack still dropped, RAIL 0x17 / Window 0x18 admitted) |
+| `rdpgw -target 192.0.2.20:3389 -target-nla -target-pin …`; xfreerdp `/u:administrator /app:program:\|\|Notepad` | Fixed-target mode works too: `channels map[cliprdr:5 drdynvc:29 rail:18 rdpdr:13]`, rail traffic in both directions, no Set Error Info |
+| Decoding the `.rdpv` (reader + events) | Meta `remoteapp:true, app:"||Notepad"`; events `rail/handshake` (target), three `window/new` (one with `detail:"无标题 - 记事本", x:34, y:187, w:477, h:523, status:shown`), `rail/exec path:"||Notepad"` (client), `rail/exec_result status:ok` (target); the replayed final frame is the Notepad window on black (a RemoteApp session has no desktop background) |
+| Failure for comparison | The first build set `INFO_RAIL | INFO_HIDEF_RAIL_SUPPORTED` in the backend Client Info: logon succeeded, then 1–2 s after `Shell start notification` the target sent `ERRINFO_GRAPHICS_SUBSYSTEM_FAILED (0x112F)` and reset the connection, also without `-monitor`; direct xfreerdp (GFX) worked. Dropping the HiDef flag fixed it: HiDef RAIL on Server 2016 needs the rdpgfx dynamic-channel pipeline, which the gateway backend does not offer |
+
+Notes: the target picks the RemoteApp desktop size from the client's monitor layout (1792×1090 here) and the recording follows; Window orders (TS_ALTSEC_WINDOW) are parsed from fast-path orders updates only, icon/notification orders are skipped by length.
+
+**Windows App (macOS) via `.rdp` file**: `full address:s:127.0.0.1:33892`, `username:s:administrator@192.0.2.20`, `remoteapplicationmode:i:1`, `remoteapplicationprogram:s:||Notepad`, `alternate shell:s:rdpinit.exe`.
+
+| Step | Result |
+|---|---|
+| Gateway TLS-only (no `-nla-users`) | Windows App reaches Client Info without a password (it only sends credentials through CredSSP); the gateway logs `needs a password for NLA` and denies, the client shows `Error code: 0x7` |
+| Gateway with `-nla-users` (front-end NLA) + `-user-target` | `credssp v6 user "administrator@192.0.2.20" … delegated=true` → `@host` stripped for the account lookup, host used for routing; `licensed (… channels [rdpdr rdpsnd rail rail_wi rail_ri cliprdr drdynvc], remoteapp true)` (Windows App also requests `rail_wi`/`rail_ri`, relayed as-is); the user typed with an IME, dragged the window, closed it and chose "don't save" in the prompt; the target then ended the session (`target-closed`, normal once the last RemoteApp window is gone); relay `client 5 pdus + 299 fast-path, target 9 pdus + 264 fast-path, input map[mouse:237 qoe:280 scancode:43 sync:19], channels map[cliprdr:4 drdynvc:27 rail:29 rdpdr:12]` |
+| Recording (46.6 s, 1792×1120) | `remoteapp:true, app:"||Notepad"`; events: `rail/handshake`, `rail/exec`, `window/new "无标题 - 记事本" 477×523`, `rail/exec_result ok`, `window/move` (drag, at most one per second), IME `CiceroUIWndFrame`/`CandidateWindow` new/show/closed, `window/new "记事本"` (save prompt), `window/activate`, `window/closed "无标题 - 记事本"`; the frame composed up to 22.5 s shows the Notepad window with the typed text, the final frame is black (the target repaints the area as background once the window is gone) |
+
+mstsc (Windows client) was not exercised this round.
+
 ## 6. Not Covered by This Round of Validation
 
 - Protocol-level determination of the user authentication result: no NLA/CredSSP; xrdp-side logs confirm the INFO_AUTOLOGON credentials logged in successfully and an Xorg session started, but no Save Session Info was received within the observation window, so the probe cannot determine the login result on its own; Save Session Info / Set Error Info decoding is verified only by unit tests. The wrong-password case was not run (xrdp failures likewise appear only in server-side logs).

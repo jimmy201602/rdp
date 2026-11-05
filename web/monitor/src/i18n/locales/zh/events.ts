@@ -1,5 +1,5 @@
 export default {
-  kind: { keyboard: '键盘', mouse: '鼠标', clipboard: '剪贴板', file: '文件', device: '映射设备', system: '系统' },
+  kind: { keyboard: '键盘', mouse: '鼠标', clipboard: '剪贴板', file: '文件', device: '映射设备', rail: 'RemoteApp', window: '窗口', system: '系统' },
   source: { client: '原用户', target: '目标系统', admin: '监控端', gateway: '网关' },
   action: {
     input: '按键（隐藏内容）', move: '移动', button_down: '按下鼠标', button_up: '释放鼠标', wheel: '滚轮',
@@ -8,6 +8,8 @@ export default {
     delete: '标记删除', rename: '重命名', set_info: '修改属性', announce: '映射设备', remove: '取消映射',
     browse: '监控端浏览', admin_download: '映射盘 → 监控端下载', admin_upload: '监控端 → 映射盘上传', admin_delete: '监控端删除',
     events_dropped: '事件丢失',
+    exec: '启动程序', exec_result: '启动结果', handshake: 'RemoteApp 握手',
+    new: '新建窗口', title: '标题变更', show: '显示状态', activate: '激活窗口', closed: '关闭窗口',
   },
   device: '设备 {{id}}',
   allKinds: '全部类型',

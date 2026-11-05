@@ -19,7 +19,9 @@ type ChannelObserver interface {
 	ServerChannel(name string, data []byte)
 }
 
-func tappedChannel(name string) bool { return name == "rdpdr" || name == "cliprdr" }
+func tappedChannel(name string) bool {
+	return name == "rdpdr" || name == "cliprdr" || name == wire.RailChannel
+}
 
 func (r *relay) writeClient(write func() error) error {
 	r.cwmu.Lock()
